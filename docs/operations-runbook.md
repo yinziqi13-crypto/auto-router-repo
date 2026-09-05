@@ -333,17 +333,115 @@ rm /opt/ai-hub/auto-router/router/router.db
 
 > ⚠️ **教训**：M2 部署 tar 包必须排除 `*.db*`，否则覆盖 router.db 导致历史决策日志丢失！
 
-### 6.5 venv 损坏（Python 依赖缺失）
+### 6.5 SQLite WAL/SHM 文件处理
+
+**背景**：aiosqlite 默认启用 WAL（Write-Ahead Logging）模式，数据库目录下会出现 3 个文件：
+
+| 文件 | 说明 |
+|---|---|
+| `router.db` | 主数据库文件 |
+| `router.db-wal` | WAL 日志（未提交事务暂存） |
+| `router.db-shm` | 共享内存索引（加速 WAL 读取） |
+
+**正常运行时不需要干预**，但以下场景需注意：
+
+#### 6.5.1 部署/备份时排除 WAL/SHM
+
+```bash
+# 打 tar 包时排除 WAL/SHM（防止在另一台机器上恢复出脏数据）
+tar czf auto-router-deploy.tar.gz \
+  --exclude='*.db-wal' --exclude='*.db-shm' \
+  -C /opt/ai-hub/auto-router router/
+
+# 备份数据库时先 checkpoint 再复制（将 WAL 写入主库）
+sqlite3 /opt/ai-hub/auto-router/router/router.db "PRAGMA wal_checkpoint(TRUNCATE);"
+cp /opt/ai-hub/auto-router/router/router.db /tmp/router.db.bak.$(date +%Y%m%d)
+```
+
+#### 6.5.2 数据库搬迁后 WAL 残留
+
+**现象**：把 `router.db` 复制到新机器，但忘了 `-wal`/`-shm`，启动后丢失最近未 checkpoint 的事务。
+
+```bash
+# 检查 WAL 中是否有未提交事务
+sqlite3 /opt/ai-hub/auto-router/router/router.db "PRAGMA wal_checkpoint(PASSIVE);"
+# 输出 0|N|N 表示 WAL 为空，安全
+# 输出非 0 表示有未 checkpoint 数据
+
+# 如果搬迁时只带了 router.db（无 wal/shm），数据会回退到最后一次 checkpoint
+# 恢复方法：无法恢复，需重新积累决策数据
+# 预防：搬迁前先执行 wal_checkpoint(TRUNCATE)
+```
+
+#### 6.5.3 强制清理 WAL（紧急恢复）
+
+**仅在数据库损坏时使用**，正常情况勿用：
+
+```bash
+# 停服务
+kill $(pgrep -f "uvicorn.*auto-router") 2>/dev/null
+
+# 删除 WAL/SHM（会丢失未提交事务，主库数据不受影响）
+rm -f /opt/ai-hub/auto-router/router/router.db-wal
+rm -f /opt/ai-hub/auto-router/router/router.db-shm
+
+# 重启
+cd /opt/ai-hub/auto-router
+nohup ./venv/bin/python -m uvicorn router.main:app \
+  --host 127.0.0.1 --port 8080 \
+  > /tmp/auto-router.log 2>&1 &
+disown
+```
+
+> ⚠️ WAL/SHM 是运行时缓存文件，删除后 SQLite 会自动重建。但未 checkpoint 的事务会丢失。
+
+### 6.6 venv 损坏（Python 依赖缺失）
 
 **现象**：启动时报 `ModuleNotFoundError: No module named 'fastapi'` 等
 
+**重建步骤**（使用项目自带的 `requirements.txt`）：
+
 ```bash
-# 重建 venv（在 /opt/ai-hub/auto-router/ 下）
+# 1. 停服务
+kill $(pgrep -f "uvicorn.*auto-router") 2>/dev/null
+sleep 2
+
+# 2. 删除旧 venv
 cd /opt/ai-hub/auto-router
 rm -rf venv
+
+# 3. 创建新 venv
 python3 -m venv venv
-./venv/bin/pip install fastapi uvicorn httpx aiosqlite
+
+# 4. 用 requirements.txt 安装依赖（版本锁定）
+./venv/bin/pip install -r requirements.txt
+# 或使用 pyproject.toml（如果已安装 pip >= 21.3）
+./venv/bin/pip install -e .
+
+# 5. 验证依赖完整
+./venv/bin/python -c "import fastapi, uvicorn, httpx, aiosqlite; print('✅ 依赖完整')"
+
+# 6. 重启服务
+nohup ./venv/bin/python -m uvicorn router.main:app \
+  --host 127.0.0.1 --port 8080 \
+  > /tmp/auto-router.log 2>&1 &
+disown
+
+# 7. 验证服务正常
+curl -s http://127.0.0.1:8080/health | python3 -m json.tool
 ```
+
+> **依赖清单**（`requirements.txt`）：
+> ```
+> fastapi==0.115.6
+> uvicorn[standard]==0.34.0
+> httpx==0.28.1
+> pydantic==2.10.4
+> python-multipart==0.0.20
+> aiosqlite==0.20.0
+> ```
+>
+> M3-1 改为 systemd 管理后，venv 重建需在 `ExecStartPre` 中加入依赖检查。
 
 ---
 

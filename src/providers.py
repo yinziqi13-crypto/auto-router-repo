@@ -41,6 +41,20 @@ class Provider(abc.ABC):
         """流式转发，yield 原始 SSE 字节流"""
 
     @abc.abstractmethod
+    async def open_stream(
+        self,
+        token: str,
+        request: ChatCompletionRequest,
+        model_mapping: Optional[Dict[str, str]] = None,
+    ) -> httpx.Response:
+        """M2.5-W6（P0-5）：打开上游流式响应并返回未消费 body 的 response 对象。
+
+        调用方负责：先检查 resp.status_code，再决定是否 aiter_bytes()；
+        无论成功失败，都必须在使用完毕后 resp.aclose()。
+        这是流式 402 降级的前提——必须在向客户端发出首个 chunk 之前拿到状态码。
+        """
+
+    @abc.abstractmethod
     async def health_check(self) -> bool:
         """健康检查，返回 True 表示可用"""
 
@@ -120,6 +134,35 @@ class NewAPIProvider(Provider):
         request: ChatCompletionRequest,
         model_mapping: Optional[Dict[str, str]] = None,
     ) -> AsyncGenerator[bytes, None]:
+        """纯透传 SSE（无需状态检查的场景使用）
+
+        与 open_stream() 的区别：本方法自带生命周期管理，错误直接抛 RuntimeError。
+        """
+        resp = await self.open_stream(token, request, model_mapping)
+        try:
+            if resp.status_code != 200:
+                error_text = await resp.aread()
+                raise RuntimeError(
+                    f"upstream {resp.status_code}: {error_text[:500]}"
+                )
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await resp.aclose()
+
+    async def open_stream(
+        self,
+        token: str,
+        request: ChatCompletionRequest,
+        model_mapping: Optional[Dict[str, str]] = None,
+    ) -> httpx.Response:
+        """M2.5-W6：打开上游流式响应，返回未消费 body 的 response。
+
+        实现要点（与定稿规格 4 的差异，已修正）：
+        不能用 `async with client.stream(...)` —— 该 context 退出时会关闭 response，
+        返回给调用方后 body 已被消费。改用 client.send(..., stream=True)，
+        生命周期交由调用方管理。
+        """
         upstream_model = self._resolve_model(request.model, model_mapping)
         payload = self._build_payload(request, upstream_model, stream=True)
         url = f"{self.base_url}/v1/chat/completions"
@@ -128,17 +171,9 @@ class NewAPIProvider(Provider):
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
         }
-
-        async with self._client.stream(
-            "POST", url, headers=headers, json=payload
-        ) as resp:
-            if resp.status_code != 200:
-                error_text = await resp.aread()
-                raise RuntimeError(
-                    f"upstream {resp.status_code}: {error_text[:500]}"
-                )
-            async for chunk in resp.aiter_bytes():
-                yield chunk
+        req = self._client.build_request("POST", url, json=payload, headers=headers)
+        resp = await self._client.send(req, stream=True)
+        return resp  # 调用方负责 aclose()
 
     async def health_check(self) -> bool:
         """简单健康检查：尝试连接 base_url 的 /health 或根路径"""
@@ -161,16 +196,28 @@ class NewAPIProvider(Provider):
         upstream_model: str,
         stream: bool = False,
     ) -> dict:
+        # M2.5-W2 配套修复（定稿规格未覆盖，但不改则 P0-7 无效）：
+        # 1) .dict() 是 Pydantic v1 写法，v2 下废弃；且会把 tool_calls=None 等
+        #    空字段原样发给上游，New API 可能拒绝。改用 model_dump(exclude_none=True)
+        # 2) extra="allow" 捕获的未知字段进入 __pydantic_extra__，不在 request.extra 里，
+        #    两个来源都要合并，否则 tools / stream_options 等仍然传不上去
         payload = {
             "model": upstream_model,
-            "messages": [m.dict() for m in request.messages],
+            "messages": [
+                m.model_dump(exclude_none=True, mode="json")
+                for m in request.messages
+            ],
             "stream": stream,
         }
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.max_tokens is not None:
             payload["max_tokens"] = request.max_tokens
-        payload.update(request.extra)
+        # 显式 extra 字段（main.py 构造时写入）
+        payload.update(request.extra or {})
+        # extra="allow" 捕获的未知字段（直接 **kwargs 构造时写入）
+        pyd_extra = getattr(request, "__pydantic_extra__", None) or {}
+        payload.update(pyd_extra)
         return payload
 
     async def close(self):

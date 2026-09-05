@@ -4,9 +4,9 @@ Auto Router M1-1 数据模型
 """
 
 from enum import Enum
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Union
 from datetime import datetime, timedelta
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ─────────────────────────────────────────────
@@ -82,6 +82,10 @@ class RouterDecisionEventRecord(BaseModel):
     latency_ms: Optional[float] = None     # 请求耗时（毫秒）
     success: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    # M2.5-W4：五态选择的 D/E 态需要调用方直接返回 HTTP 错误，
+    # 用这两个字段把错误从决策层带出去（流式路径必须在发响应头前判断）
+    error_code: Optional[int] = None       # 404（无候选）/ 503（全池耗尽且无 paid 兜底）
+    error_message: Optional[str] = None
 
 
 # ─────────────────────────────────────────────
@@ -144,15 +148,29 @@ class QuotaState:
 # 请求/响应模型
 # ─────────────────────────────────────────────
 
+# M2.5-W2（P0-7）：OpenAI 协议兼容
+# content 支持多模态数组；补 tool_calls / tool_call_id / name，避免 Agent 客户端
+# （WorkBuddy / Trae）的工具调用与多轮上下文被 Pydantic 静默丢弃。
 class ChatMessage(BaseModel):
+    # 消息级也需要 allow，否则各家客户端自定义字段（如 reasoning_content）
+    # 会被静默丢弃，多轮上下文会损坏
+    model_config = ConfigDict(extra="allow")
+
     role: str
-    content: str
+    content: Union[str, List[Dict[str, Any]]] = ""
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
-    """OpenAI 兼容请求（仅接收必要字段）"""
+    """OpenAI 兼容请求（M2.5 起未知字段原样保留并透传）"""
+    # extra="allow"：tools / tool_choice / stream_options / response_format
+    # 等字段进入 __pydantic_extra__，由 providers._build_payload() 合并转发
+    model_config = ConfigDict(extra="allow")
+
     model: str
-    messages: list[ChatMessage]
+    messages: List[ChatMessage]
     stream: bool = False
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None

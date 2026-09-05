@@ -258,67 +258,52 @@ async def chat_completions(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Request validation failed: {e}")
 
-    # 3. 路由 + 转发（非流式）或 纯决策（流式，转发由 forward_stream 完成）
+    # ── M2.5-W5（规格 3）：未知模型 → 404，不静默回退 ──
+    # 只在入口做精确匹配；容错匹配（fuzzy）不在 M2.5 范围，M3 作为独立功能加。
+    # auto-free 是虚拟模型，跳过此检查交给决策层做自动选路。
+    from .decision import AUTO_MODEL
+    if model != AUTO_MODEL:
+        known_models = set()
+        for _p, _cfg in (config.provider_models or {}).items():
+            if isinstance(_cfg, dict):
+                known_models.update(_cfg.get("models", []))
+            elif isinstance(_cfg, (list, tuple, set)):
+                known_models.update(_cfg)
+        if model not in known_models:
+            return JSONResponse(
+                status_code=404,
+                content={"error": {
+                    "message": f"model '{model}' not found in any provider pool",
+                    "type": "model_not_found",
+                }},
+            )
+
+    # 3. 路由 + 转发（非流式）或 流式路由（M2.5 起走 route_stream）
     if not stream:
         # 非流式：route() 内部完成 决策 + forward + 402 换 token 重试
         resp, decision = await eng.route(chat_req)
         if resp["status_code"] == 200 and resp["body"]:
             return JSONResponse(content=resp["body"])
-        # 透传 upstream 错误
+        # 透传 upstream 错误（含 W4 的 D/E 态：503 / 404）
         return JSONResponse(
             status_code=resp["status_code"] or 502,
             content={"error": resp["error"] or "upstream error"},
         )
 
-    # ── 流式：decide() 只决策不转发，由 forward_stream() 单次转发 ──
+    # ── 流式：先决策并检查错误，再创建 StreamingResponse ──
+    # 必须在响应头发出之前判断，否则 HTTP 已经是 200 无法再改状态码
     decision = await eng.decide(chat_req)
-
-    selected_token = (
-        config.token_free
-        if decision.selected_token == "free"
-        else config.token_paid
-    )
-    mapping = config.model_mapping.get(decision.selected_provider, {})
-
-    # M2-3：流式转发用 logical_model 替代原始模型名
-    stream_req = ChatCompletionRequest(
-        model=decision.logical_model,
-        messages=chat_req.messages,
-        stream=True,
-        temperature=chat_req.temperature,
-        max_tokens=chat_req.max_tokens,
-        extra=chat_req.extra,
-    )
-
-    # M2-6：流式转发用 provider_registry 拿 provider 实例
-    _prov = decision_eng._get_provider(decision.selected_provider)
-    if _prov is None:
-        # fallback：用 default provider
-        _prov = decision_eng._provider_registry.get_default()
-    if _prov is None:
-        raise RuntimeError(f"no provider available for '{decision.selected_provider}'")
-
-    # 流式转发 + 决策日志回写（async generator 内异步记录）
-    async def _stream_generator() -> AsyncGenerator[bytes, None]:
-        try:
-            async for chunk in _prov.forward_stream(
-                token=selected_token,
-                request=stream_req,
-                model_mapping=mapping,
-            ):
-                yield chunk
-            # 流式成功结束 → 回写 decision event（success=True）
-            decision.success = True
-            await _record_stream_decision(eng, decision)
-        except Exception as e:
-            logger.error(f"[Stream] error: {e}")
-            # SSE 格式错误事件
-            yield f"data: {json.dumps({'error': str(e)})}\n\n".encode()
-            decision.success = False
-            await _record_stream_decision(eng, decision)
+    if decision.error_code:
+        return JSONResponse(
+            status_code=decision.error_code,
+            content={"error": {
+                "message": decision.error_message or "routing failed",
+                "type": "model_not_found" if decision.error_code == 404 else "no_available_pool",
+            }},
+        )
 
     return StreamingResponse(
-        _stream_generator(),
+        eng.route_stream(chat_req, decision),
         media_type="text/event-stream",
     )
 

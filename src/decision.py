@@ -14,9 +14,10 @@ Decision Engine — 决策引擎（M1-1 ~ M1-6 修复版）
 """
 
 import uuid
+import json
 import logging
 from datetime import datetime
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, AsyncGenerator
 
 import aiosqlite
 
@@ -93,6 +94,11 @@ def _free_pool_check(
     ]
     all_free_exhausted = bool(free_providers) and not free_available
     return free_providers, free_available, all_free_exhausted
+
+
+# M2.5-W3（P0-3）：虚拟模型名。只有显式请求该模型才进入 task_type 检测 + 自动选路，
+# 点名真实模型一律原样保留。名称与产品文档 / New API 别名保持一致，不要改成 "auto"。
+AUTO_MODEL = "auto-free"
 
 
 class DecisionEngine:
@@ -195,6 +201,117 @@ class DecisionEngine:
             paid_cands = [p for p in candidates if p not in free_provider_set]
             return (paid_cands[0] if paid_cands else (candidates[-1] if candidates else None))
 
+    # ── M2.5-W4（P0-4）：五态候选池选择 ──┤
+
+    def _select_pool(self, logical_model: str) -> Dict[str, Any]:
+        """按候选池五态选择 provider 与 token 类型。
+
+        五态定义（定稿规格 2）：
+          A 有可用 free 候选（非全 exhausted）      → free
+          B free 候选全 exhausted + 有 paid 候选     → paid, exhausted_skip
+          C 无 free 候选 + 有 paid 候选              → paid, paid_only
+          D free 候选全 exhausted + 无 paid 候选     → 503
+          E 无候选（模型不在任何 provider_models）   → 404
+
+        修复要点：token 类型从「最终候选池」推导，不再从
+        「是否 all_free_exhausted」间接推断（旧逻辑在 C 态会误判为 free）。
+        """
+        priority = self.config.provider_priority or list(
+            (self.config.provider_models or {}).keys()
+        )
+        provider_models = self.config.provider_models or {}
+        free_set = set(self.config.free_providers or [])
+
+        def _idx(p):
+            try:
+                return priority.index(p)
+            except ValueError:
+                return 999
+
+        candidates = [
+            p for p, models in provider_models.items()
+            if logical_model in (models or [])
+        ]
+        candidates.sort(key=_idx)
+
+        # 状态 E：模型不在任何 provider 的池里
+        if not candidates:
+            return {
+                "state": "E", "provider": None, "token": None,
+                "fallback_reason": None,
+                "error_code": 404,
+                "error_message": f"model '{logical_model}' not found in any provider pool",
+                "free_candidates": [], "paid_candidates": [],
+            }
+
+        free_cands = [p for p in candidates if p in free_set]
+        paid_cands = [p for p in candidates if p not in free_set]
+
+        if free_cands:
+            free_available = [
+                p for p in free_cands
+                if self.state.get_status(p, logical_model) != QuotaStatus.EXHAUSTED
+            ]
+            if free_available:
+                # 状态 A
+                return {
+                    "state": "A", "provider": free_available[0], "token": "free",
+                    "fallback_reason": None, "error_code": None, "error_message": None,
+                    "free_candidates": free_cands, "paid_candidates": paid_cands,
+                }
+            # free 全 exhausted
+            if paid_cands:
+                # 状态 B
+                return {
+                    "state": "B", "provider": paid_cands[0], "token": "paid",
+                    "fallback_reason": "exhausted_skip",
+                    "error_code": None, "error_message": None,
+                    "free_candidates": free_cands, "paid_candidates": paid_cands,
+                }
+            # 状态 D
+            return {
+                "state": "D", "provider": None, "token": None,
+                "fallback_reason": None,
+                "error_code": 503,
+                "error_message": "all free pools exhausted, no paid fallback",
+                "free_candidates": free_cands, "paid_candidates": [],
+            }
+
+        # 无 free 候选
+        if paid_cands:
+            # 状态 C（修复点：旧逻辑此处 token 仍为 free）
+            return {
+                "state": "C", "provider": paid_cands[0], "token": "paid",
+                "fallback_reason": "paid_only",
+                "error_code": None, "error_message": None,
+                "free_candidates": [], "paid_candidates": paid_cands,
+            }
+
+        # 理论上不可达（candidates 非空时 free/paid 必居其一），兜底为 E
+        return {
+            "state": "E", "provider": None, "token": None,
+            "fallback_reason": None,
+            "error_code": 404,
+            "error_message": f"model '{logical_model}' not found in any provider pool",
+            "free_candidates": [], "paid_candidates": [],
+        }
+
+    def _resolve_logical_model(self, request: ChatCompletionRequest):
+        """M2.5-W3：解析逻辑模型名。
+
+        - model == auto-free  → task_type 检测 + model_routes 自动选路
+        - 其他（点名真实模型） → 原样保留，只选可执行渠道，绝不改写
+
+        模型名隔离约束：free/paid 隔离靠模型名 + model_mapping 实现，
+        因此点名模型一旦被改写就可能击穿池隔离。
+        """
+        task_type = self._detect_task_type(request)
+        if request.model == AUTO_MODEL:
+            logical_model = self._resolve_route_model(task_type, request.model)
+        else:
+            logical_model = request.model
+        return task_type, logical_model
+
     # ── decide()：只决策不转发（流式用） ──┤
 
     async def decide(
@@ -202,51 +319,29 @@ class DecisionEngine:
     ) -> RouterDecisionEventRecord:
         """
         只做路由决策，不调上游（用于流式请求）
-        降级逻辑与 route() 完全一致：
-          所有持有该模型的 free provider 全 exhausted → 才降级 paid
+        M2.5：模型解析按 W3 规则，池选择按 W4 五态。
+        D/E 态不会抛异常，通过 decision.error_code / error_message 交给调用方
+        ——流式路径必须在发出响应头之前判断，否则 HTTP 已经是 200 无法再改。
         """
         request_id = str(uuid.uuid4())
-        task_type = self._detect_task_type(request)
-        logical_model = self._resolve_route_model(task_type, request.model)
+        task_type, logical_model = self._resolve_logical_model(request)
+        sel = self._select_pool(logical_model)
 
-        # free 池状态（共用逻辑，用 config.free_providers 显式列表）
-        free_providers, free_available, all_free_exhausted = _free_pool_check(
-            self.config.free_providers,
-            self.config.provider_models,
-            lambda p, m: self.state.get_status(p, m),
-            logical_model,
+        decision = RouterDecisionEventRecord(
+            request_id=request_id,
+            original_model=request.model,
+            logical_model=logical_model,
+            task_type=task_type,
+            selected_provider=sel["provider"] or "unknown",
+            selected_token=sel["token"] or "free",
+            fallback_reason=sel["fallback_reason"],
+            quota_status_before=(
+                self.state.get_status(sel["provider"], logical_model)
+                if sel["provider"] else None
+            ),
+            error_code=sel["error_code"],
+            error_message=sel["error_message"],
         )
-        provider_paid = self._pick_provider(logical_model, prefer_free=False)
-
-        if all_free_exhausted and provider_paid:
-            # 所有 free provider 都 exhausted → 降级 paid
-            decision = RouterDecisionEventRecord(
-                request_id=request_id,
-                original_model=request.model,
-                logical_model=logical_model,
-                task_type=task_type,
-                selected_provider=provider_paid,
-                selected_token="paid",
-                fallback_reason="exhausted_skip",
-                quota_status_before=self.state.get_status(provider_paid, logical_model),
-            )
-        else:
-            # free 池有可用 provider → 选第一个可用的 free provider
-            selected = (
-                free_available[0]
-                if free_available
-                else (provider_paid or "unknown")
-            )
-            decision = RouterDecisionEventRecord(
-                request_id=request_id,
-                original_model=request.model,
-                logical_model=logical_model,
-                task_type=task_type,
-                selected_provider=selected,
-                selected_token="free",
-                quota_status_before=self.state.get_status(selected, logical_model),
-            )
-
         return decision
 
     # ── route()：决策 + 转发（非流式用） ──┤
@@ -263,48 +358,47 @@ class DecisionEngine:
           单个 free provider exhausted → 选下一个可用 free provider（不降级）
         """
         request_id = str(uuid.uuid4())
-        task_type = self._detect_task_type(request)
-        logical_model = self._resolve_route_model(task_type, request.model)
+        task_type, logical_model = self._resolve_logical_model(request)
 
-        # free 池状态（共用逻辑，用 config.free_providers 显式列表）
-        free_providers, free_available, all_free_exhausted = _free_pool_check(
-            self.config.free_providers,
-            self.config.provider_models,
-            lambda p, m: self.state.get_status(p, m),
-            logical_model,
-        )
-        provider_paid = self._pick_provider(logical_model, prefer_free=False)
-
-        # 构建初始 decision
-        if all_free_exhausted and provider_paid:
-            # 所有 free provider 都 exhausted → 直接走 paid
-            provider_selected = provider_paid
-            initial_token = "paid"
-            fallback_reason = "exhausted_skip"
-        else:
-            # free 池有可用 provider → 选第一个可用的
-            available = (
-                free_available[0]
-                if free_available
-                else (provider_paid or "unknown")
-            )
-            provider_selected = available
-            initial_token = "free"
-            fallback_reason = None
+        # M2.5-W4：五态选择，token 类型从最终候选池推导
+        sel = self._select_pool(logical_model)
+        provider_selected = sel["provider"]
+        initial_token = sel["token"]
+        paid_candidates = sel["paid_candidates"]
 
         decision = RouterDecisionEventRecord(
             request_id=request_id,
             original_model=request.model,
             logical_model=logical_model,
             task_type=task_type,
-            selected_provider=provider_selected,
-            selected_token=initial_token,
-            fallback_reason=fallback_reason,
+            selected_provider=provider_selected or "unknown",
+            selected_token=initial_token or "free",
+            fallback_reason=sel["fallback_reason"],
             quota_status_before=(
                 self.state.get_status(provider_selected, logical_model)
-                if provider_selected != "unknown" else None
+                if provider_selected else None
             ),
+            error_code=sel["error_code"],
+            error_message=sel["error_message"],
         )
+
+        # 状态 D/E：无可执行渠道，直接返回，不向上游发请求
+        if sel["error_code"]:
+            err_resp = {
+                "status_code": sel["error_code"],
+                "body": None,
+                "error": sel["error_message"],
+                "latency_ms": 0,
+            }
+            decision.success = False
+            self._decision_log.append(decision)
+            if self._db:
+                from .db import insert_decision_event
+                try:
+                    await insert_decision_event(self._db, decision)
+                except Exception as e:
+                    logger.warning(f"[Decision] failed to write decision event: {e}")
+            return err_resp, decision
 
         # M2-3：构造转发请求（用 logical_model 替代 original_model 做后续路由）
         forward_req = ChatCompletionRequest(
@@ -316,9 +410,10 @@ class DecisionEngine:
             extra=request.extra,
         )
 
-        # 如果 free 全 exhausted → 直接用 paid token 转发，不走 free 尝试
-        if all_free_exhausted and provider_paid:
-            # M2-6: 通过 registry 拿 provider 实例
+        # 状态 B/C：直接用 paid token 转发，不做 free 尝试
+        if initial_token == "paid":
+            provider_paid = provider_selected
+            # provider 实例统一走 _get_provider()（business → transport 映射）
             _prov = self._get_provider(provider_paid)
             if _prov is None:
                 logger.error(f"[Decision] provider '{provider_paid}' not registered")
@@ -363,8 +458,9 @@ class DecisionEngine:
         resp = await _prov.forward(token_free, forward_req, mapping_free)
         decision.latency_ms = resp["latency_ms"]
 
-        # 检查 402
-        if resp["status_code"] == 402 and provider_paid:
+        # 检查 402（走到这里只可能是状态 A：已用 free token 打过一次）
+        if resp["status_code"] == 402 and paid_candidates:
+            provider_paid = paid_candidates[0]
             logger.info(
                 f"[Decision] 402 from {provider_selected}, "
                 f"switching to paid provider {provider_paid}"
@@ -380,8 +476,10 @@ class DecisionEngine:
             token_paid = self.config.token_paid
             mapping_paid = self.config.model_mapping.get(provider_paid, {})
 
-            # M2-6: 通过 registry 拿 provider 实例（402 后目标 provider）
-            _prov2 = self._provider_registry.get(provider_paid)
+            # M2.5-W1（P0-2）：必须用 _get_provider() 完成
+            # business provider → transport 映射。此前直接查 registry，
+            # 而业务名（tencent_plan 等）不在注册表里，必然返回 None → 500
+            _prov2 = self._get_provider(provider_paid)
             if _prov2 is None:
                 logger.error(f"[Decision] provider '{provider_paid}' not registered for 402 retry")
                 resp = {
@@ -413,6 +511,119 @@ class DecisionEngine:
 
         return resp, decision
 
+    # ── M2.5-W6（P0-5）：流式路由 + 402 降级 ──┤
+
+    async def route_stream(
+        self,
+        request: ChatCompletionRequest,
+        decision: Optional[RouterDecisionEventRecord] = None,
+    ) -> AsyncGenerator[bytes, None]:
+        """流式路由：在向客户端发出首个 chunk 之前检查上游状态，遇 402 换 paid 重试一次。
+
+        用法（main.py）：
+            decision = await eng.decide(chat_req)
+            if decision.error_code:      # 必须在创建 StreamingResponse 之前判断
+                return JSONResponse(...)
+            return StreamingResponse(eng.route_stream(chat_req, decision), ...)
+
+        与定稿规格 4 的差异（已修正）：
+        规格伪代码让 route_stream 直接返回 generator，但那样 D/E 态的错误
+        只能在 generator 内部 yield —— 此时 HTTP 200 已经发出，状态码改不了。
+        故改为「先 decide 检查 → 再创建 generator」两段式。
+        """
+        if decision is None:
+            decision = await self.decide(request)
+
+        logical_model = decision.logical_model
+        sel = self._select_pool(logical_model)
+        paid_candidates = sel["paid_candidates"]
+
+        token = (
+            self.config.token_free
+            if decision.selected_token == "free"
+            else self.config.token_paid
+        )
+
+        stream_req = ChatCompletionRequest(
+            model=logical_model,
+            messages=request.messages,
+            stream=True,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            extra=request.extra,
+        )
+
+        provider = self._get_provider(decision.selected_provider)
+        if provider is None:
+            yield self._sse_error(f"no provider for '{decision.selected_provider}'")
+            return
+
+        mapping = self.config.model_mapping.get(decision.selected_provider, {})
+        resp = None
+        try:
+            resp = await provider.open_stream(token, stream_req, mapping)
+
+            # 关键：在 yield 任何数据之前检查状态码
+            if (
+                resp.status_code == 402
+                and decision.selected_token == "free"
+                and paid_candidates
+            ):
+                # 必须记录，否则下次请求仍要先打一次 free 付 402 探测代价
+                await self.state.record_402(
+                    decision.selected_provider, logical_model
+                )
+                await resp.aclose()
+                resp = None
+
+                provider_paid = paid_candidates[0]
+                decision.selected_provider = provider_paid
+                decision.selected_token = "paid"
+                decision.fallback_reason = "402_streaming"
+
+                provider = self._get_provider(provider_paid)
+                mapping_paid = self.config.model_mapping.get(provider_paid, {})
+                resp = await provider.open_stream(
+                    self.config.token_paid, stream_req, mapping_paid
+                )
+
+            if resp.status_code != 200:
+                error_text = await resp.aread()
+                decision.success = False
+                yield self._sse_error(
+                    f"upstream {resp.status_code}: {error_text[:500]}"
+                )
+                return
+
+            # 一旦开始 yield，不允许再重试
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+            decision.success = True
+
+        except Exception as e:
+            logger.error(f"[Decision] stream error: {e}")
+            decision.success = False
+            yield self._sse_error(str(e))
+        finally:
+            if resp is not None:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+            self._decision_log.append(decision)
+            if self._db:
+                from .db import insert_decision_event
+                try:
+                    await insert_decision_event(self._db, decision)
+                except Exception as e:
+                    logger.warning(
+                        f"[Decision] failed to write stream decision: {e}"
+                    )
+
+    @staticmethod
+    def _sse_error(message: str) -> bytes:
+        return f"data: {json.dumps({'error': message})}\n\n".encode()
+
     # ── 内部：任务类型检测（M2-3 扩充版） ──┤
 
     def _detect_task_type(self, request: ChatCompletionRequest) -> TaskType:
@@ -434,7 +645,7 @@ class DecisionEngine:
         user_msg = ""
         for msg in reversed(request.messages):
             if msg.role == "user":
-                user_msg = msg.content.lower()
+                user_msg = self._flatten_content(msg.content).lower()
                 break
 
         # 按优先级顺序检测（DETECTION_ORDER）
@@ -449,6 +660,29 @@ class DecisionEngine:
 
         # 未命中任何关键词 → 默认 TEXT
         return TaskType.TEXT
+
+    @staticmethod
+    def _flatten_content(content: Any) -> str:
+        """M2.5-W2 配套：把可能为多模态数组的 content 压平成纯文本。
+
+        P0-7 把 content 放开为 Union[str, List] 后，任务类型检测里直接
+        `content.lower()` 会在数组上抛 AttributeError —— 任何图片输入都会 500。
+        这里只抽取 text 片段用于关键词检测，不改动原始消息。
+        """
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        parts.append(str(item.get("text", "")))
+                elif isinstance(item, str):
+                    parts.append(item)
+            return " ".join(parts)
+        return str(content)
 
     # ── 内部：按任务类型解析推荐模型（M2-3） ──┤
 
