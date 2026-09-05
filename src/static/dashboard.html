@@ -159,7 +159,7 @@
 <!-- 饼图区 -->
 <div class="chart-grid" data-page-node-id="fDLAp1v7EghrTNpqCGUADO">
   <div class="chart-card" data-page-node-id="vErisGs2ei7KGa0QR0yq15">
-    <h3 data-page-node-id="GXibMa3Q7ttsmLCwCM2qWM">渠道分布 (Provider)</h3>
+    <h3 data-page-node-id="GXibMa3Q7ttsmLCwCM2qWM">决策池分布（非实际执行渠道）</h3>
     <div class="chart-wrap" data-page-node-id="lYXVUMRMfjYuVXDT2Ezjb4"><canvas id="chartProvider" data-page-node-id="pIEoudQpMXC0T0PdfIz6Ek"></canvas></div>
   </div>
   <div class="chart-card" data-page-node-id="pUOZLb152qOfmAOhetznjV">
@@ -195,7 +195,28 @@ function initCharts() {
   const ctxTask = document.getElementById('chartTaskType').getContext('2d');
   const ctxHourly = document.getElementById('chartHourly').getContext('2d');
 
-  charts.provider = new Chart(ctxProvider, { type: 'doughnut', data: { labels: [], datasets: [{ data: [], backgroundColor: [] }] }, options: pieOpts });
+  // M2.5 规格 6（WorkBuddy）：provider 图表示的是「决策选取的池」，
+  // 不是 New API 实际命中的渠道。M0 实测存在约 13~20% 泄漏
+  // （free 令牌可能打到付费渠道，反之亦然）。在 P0-6 渠道回执落地前，
+  // 标题与 tooltip 必须明确标注，避免把决策池误读成实际渠道。
+  const providerPieOpts = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { position: 'bottom', labels: { color: '#cbd5e1', boxWidth: 12, padding: 12 } },
+      tooltip: {
+        callbacks: {
+          afterBody: function () {
+            return [
+              '—— 决策池分布，非实际执行渠道',
+              'Auto Router 控制令牌类型，New API 在令牌可访问渠道内按 priority/weight 路由，实际命中渠道可能不同'
+            ];
+          }
+        }
+      }
+    }
+  };
+  charts.provider = new Chart(ctxProvider, { type: 'doughnut', data: { labels: [], datasets: [{ data: [], backgroundColor: [] }] }, options: providerPieOpts });
   charts.model = new Chart(ctxModel, { type: 'doughnut', data: { labels: [], datasets: [{ data: [], backgroundColor: [] }] }, options: pieOpts });
   charts.task = new Chart(ctxTask, { type: 'doughnut', data: { labels: [], datasets: [{ data: [], backgroundColor: [] }] }, options: pieOpts });
   charts.hourly = new Chart(ctxHourly, {

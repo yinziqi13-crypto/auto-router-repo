@@ -6,7 +6,7 @@ Auto Router M1-1 数据模型
 from enum import Enum
 from typing import Optional, Dict, Any, List, Union
 from datetime import datetime, timedelta
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 # ─────────────────────────────────────────────
@@ -161,6 +161,18 @@ class ChatMessage(BaseModel):
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _null_content_to_empty(cls, v):
+        """M2.5-W2 补漏（定稿规格 5 未覆盖，实测才发现）：
+
+        OpenAI 协议里 assistant 消息带 tool_calls 时 content 是 JSON null，
+        Agent 客户端（WorkBuddy / Trae / Claude Code）每次工具调用都会发这种消息。
+        规格 5 把 content 定义为 Union[str, List] 不含 None，这类请求会直接 422。
+        这里在协议层接受 null 并归一为空串，既兼容上游，也免得下游到处判 None。
+        """
+        return "" if v is None else v
 
 
 class ChatCompletionRequest(BaseModel):
