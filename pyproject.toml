@@ -29,6 +29,10 @@ include = ["router*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# 注意：pythonpath=["src"] 只把 src/ 加入搜索路径，
+# 但 import router 会找 src/router/ 目录（不存在）。
+# 仓库内测试依赖 tests/conftest.py 的 types.ModuleType("router") 兜底。
+# 线上部署路径恰好叫 router/ 所以不受影响。
 pythonpath = ["src"]
 
 [tool.setuptools.package-data]
