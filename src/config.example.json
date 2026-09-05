@@ -10,7 +10,8 @@
   },
   "model_mapping": {
     "tencent_plan": {
-      "deepseek-v4-flash": "deepseek-v4-flash-202605"
+      "deepseek-v4-flash": "deepseek-v4-flash-202605",
+      "deepseek-v4-pro": "deepseek-v4-pro-202606"
     }
   },
   "free_providers": ["tencent_free", "bailian_free"],
