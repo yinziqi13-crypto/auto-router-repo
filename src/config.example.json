@@ -1,0 +1,43 @@
+{
+  "new_api_base_url": "http://127.0.0.1:3000",
+  "token_free": "sk-YOUR_FREE_TOKEN_HERE",
+  "token_paid": "sk-YOUR_PAID_TOKEN_HERE",
+  "provider_models": {
+    "tencent_free": ["deepseek-v4-flash", "qwen3.8-flash", "glm-5.2"],
+    "bailian_free": ["deepseek-v4-flash", "qwen3.8-flash", "glm-5.2"],
+    "bailian_lite": ["qwen3.8-flash", "qwen3.7-max", "qwen3.6-flash"],
+    "tencent_plan": ["deepseek-v4-flash", "deepseek-v4-pro", "qwen3.8-flash"]
+  },
+  "model_mapping": {
+    "tencent_plan": {
+      "deepseek-v4-flash": "deepseek-v4-flash-202605"
+    }
+  },
+  "free_providers": ["tencent_free", "bailian_free"],
+  "provider_priority": [
+    "tencent_free",
+    "bailian_free",
+    "bailian_lite",
+    "tencent_plan"
+  ],
+  "three_pool_keywords": {
+    "vision": ["图片", "图像", "看图", "识别图片", "截图", "照片", "图片内容", "分析图片", "读取图片", "image", "photo", "picture", "vision", "visual", "screenshot", "describe this image", "what's in this image"],
+    "video": ["视频", "视频生成", "生成视频", "视频理解", "视频内容", "视频分析", "video", "movie", "clip", "vid", "footage", "视频里"],
+    "audio": ["语音", "语音识别", "语音转文字", "转写", "转录", "听写", "音频", "录音", "语音内容", "asr", "tts", "whisper", "speech", "audio", "transcribe", "transcription", "voice to text"],
+    "image": ["画图", "绘图", "绘画", "生成图片", "图片生成", "文生图", "图生图", "画一张", "生成图", "作画", "dall-e", "dalle", "image generation", "generate image", "midjourney", "stable diffusion", "text to image"]
+  },
+  "routing_strategy": "cost_optimized",
+  "providers": {
+    "new_api": {
+      "type": "new_api",
+      "base_url": "http://127.0.0.1:3000",
+      "is_default": true
+    }
+  },
+  "model_routes": {
+    "text": "deepseek-v4-flash",
+    "vision": null,
+    "audio": null,
+    "image": null
+  }
+}

@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="62ldiJoFGqkqbd6SortQyb">
+<head data-page-node-id="nJKEOz2f0gfadohkUxUQtC">
+<meta charset="UTF-8" data-page-node-id="RSB6ZsObMykazx757aGCH8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="262ojAbsGC4HcfcCm2g7Af">
+<title>Auto Router 运营看板</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --card-border: #334155;
+    --text: #e2e8f0;
+    --text-dim: #94a3b8;
+    --accent: #38bdf8;
+    --green: #34d399;
+    --red: #f87171;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+    min-height: 100vh;
+  }
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .header h1 { font-size: 22px; font-weight: 600; }
+  .header .sub { color: var(--text-dim); font-size: 13px; margin-top: 4px; }
+  .header-right { display: flex; align-items: center; gap: 12px; }
+  .time-range select {
+    background: var(--card);
+    color: var(--text);
+    border: 1px solid var(--card-border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .btn-refresh {
+    background: var(--accent);
+    color: #0f172a;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 18px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .2s;
+  }
+  .btn-refresh:hover { opacity: .85; }
+  .btn-refresh:disabled { opacity: .5; cursor: wait; }
+  .last-updated { color: var(--text-dim); font-size: 12px; }
+
+  /* KPI 卡片 */
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .kpi-card {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 18px;
+  }
+  .kpi-card .label { color: var(--text-dim); font-size: 13px; margin-bottom: 8px; }
+  .kpi-card .value { font-size: 30px; font-weight: 700; }
+  .kpi-card .unit { font-size: 14px; font-weight: 400; color: var(--text-dim); margin-left: 4px; }
+  .kpi-card.green .value { color: var(--green); }
+  .kpi-card.red .value { color: var(--red); }
+  .kpi-card.blue .value { color: var(--accent); }
+  .kpi-card .extra { color: var(--text-dim); font-size: 12px; margin-top: 6px; }
+
+  /* 图表区 */
+  .chart-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .chart-card {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 18px;
+  }
+  .chart-card h3 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+  .chart-card .chart-wrap { position: relative; height: 260px; }
+  .chart-card.wide { grid-column: 1 / -1; }
+  .chart-card.wide .chart-wrap { height: 240px; }
+
+  .empty { color: var(--text-dim); text-align: center; padding: 60px 0; }
+  .error-banner {
+    background: rgba(248,113,113,.12);
+    border: 1px solid var(--red);
+    color: var(--red);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    display: none;
+  }
+</style>
+</head>
+<body data-page-node-id="1BEUo6Azc92mGKAhv4BOgh">
+<div class="header" data-page-node-id="5Z4M2c8wxqynzsVajgLXMq">
+  <div data-page-node-id="B52kmXA6ZjbcU6BKUa7Iz6">
+    <h1 data-page-node-id="HD81DrMnEoa0D7h3N3CqQZ">📊 Auto Router 运营看板</h1>
+    <div class="sub" data-page-node-id="89GgoQj5BvffHzctwCoC7d">基于 router_decision_event 决策日志的实时统计</div>
+  </div>
+  <div class="header-right" data-page-node-id="JcNtLC1z7XwWfTNAlNDm8V">
+    <div class="time-range" data-page-node-id="XdigQOgc02qsAxEVkC33XI">
+      <select id="timeRange" onchange="loadStats()" data-page-node-id="DbbpZ4zEpnlbmR3WKEduF6">
+        <option value="1h" data-page-node-id="rcG0aI51G8AmBTPUh7ZTz4">最近 1 小时</option>
+        <option value="6h" data-page-node-id="SIgH8O0I3cdk6LC8Wx9QYc">最近 6 小时</option>
+        <option value="24h" selected data-page-node-id="HmmLA7CoJvurlIThZyVer3">最近 24 小时</option>
+        <option value="7d" data-page-node-id="NOE9EsTLEgZ9aYmCFCTfDd">最近 7 天</option>
+      </select>
+    </div>
+    <button class="btn-refresh" id="btnRefresh" onclick="loadStats()" data-page-node-id="O1eXVFXD1oGIPwWGAWx4cE">🔄 刷新</button>
+    <span class="last-updated" id="lastUpdated" data-page-node-id="ZIB8fKw1v5a8KJk0F29dCS"></span>
+  </div>
+</div>
+
+<div class="error-banner" id="errorBanner" data-page-node-id="ZzxSOkDHGZf8vQ8dkp7rD2"></div>
+
+<!-- KPI 卡片 -->
+<div class="kpi-grid" data-page-node-id="oSCnVTA7Zv8KE0f1wmH79D">
+  <div class="kpi-card blue" data-page-node-id="QWaFzEJicDwfHroxqOMKJ3">
+    <div class="label" data-page-node-id="D9Aee7hMtVBIBka5PBk608">总请求数</div>
+    <div class="value" data-page-node-id="0wsSaOWtpGtxdeWqs9VRAZ"><span id="kpiTotal" data-page-node-id="FA3pHeGzy0DvMNAxLBxUsg">-</span></div>
+    <div class="extra" id="kpiTotalSub" data-page-node-id="3eVIHxCLtB37dpRrEs9Xke"></div>
+  </div>
+  <div class="kpi-card green" data-page-node-id="A1RBJV8BsPjxrTW1e9YP75">
+    <div class="label" data-page-node-id="A4WQa0NyGwJCwqsFHfXvNn">成功率</div>
+    <div class="value" data-page-node-id="O4KxljVDBR25zJntNRP5m6"><span id="kpiSuccessRate" data-page-node-id="OH1iYHCobe5zgC5O2Pdrkh">-</span></div>
+    <div class="extra" data-page-node-id="ItLwq6FAB1HDqb8Zu7dkAe"><span id="kpiSuccessCount" data-page-node-id="w6YMDXar6SdQ4c20SXEqzM">-</span> 成功 / <span id="kpiFailCount" data-page-node-id="2FP4Pc5q2z45e10A7OFDj9">-</span> 失败</div>
+  </div>
+  <div class="kpi-card blue" data-page-node-id="RmKKDGY6XhZSdGwebx1h90">
+    <div class="label" data-page-node-id="YE6pqTPAH7Ca7Yb4NreaT6">Free 占比</div>
+    <div class="value" data-page-node-id="s8XfyxtHL5QkORdPZ5Brhn"><span id="kpiFreeRatio" data-page-node-id="aUJpFQTEuPMczChs0W4KKp">-</span></div>
+    <div class="extra" data-page-node-id="M4t52TLKFLT7EiJK2p14NI"><span id="kpiFreeCount" data-page-node-id="HNn47FENNB7bYa3Rmyfx1p">-</span> free / <span id="kpiPaidCount" data-page-node-id="Aiiu1k9ITlu1yAPTXoG84b">-</span> paid</div>
+  </div>
+  <div class="kpi-card" data-page-node-id="PC4wuiE1tUTGZMjclUES49">
+    <div class="label" data-page-node-id="kZJFNyWh2Kp5SuBf1hbCc6">平均延迟</div>
+    <div class="value" data-page-node-id="L5ISUAciVMm1aKdKQOozW6"><span id="kpiLatency" data-page-node-id="mTV9MhIusY9S1ETILUbDSt">-</span><span class="unit" data-page-node-id="CFNc7xUlZNU8oPR7ENJKgx">ms</span></div>
+    <div class="extra" data-page-node-id="CDSRw2nbJAWKYrJdmAyh1X">降级次数：<span id="kpiFallback" data-page-node-id="RDg1h9yoFXdCJ18SX1DqVP">-</span></div>
+  </div>
+</div>
+
+<!-- 饼图区 -->
+<div class="chart-grid" data-page-node-id="fDLAp1v7EghrTNpqCGUADO">
+  <div class="chart-card" data-page-node-id="vErisGs2ei7KGa0QR0yq15">
+    <h3 data-page-node-id="GXibMa3Q7ttsmLCwCM2qWM">渠道分布 (Provider)</h3>
+    <div class="chart-wrap" data-page-node-id="lYXVUMRMfjYuVXDT2Ezjb4"><canvas id="chartProvider" data-page-node-id="pIEoudQpMXC0T0PdfIz6Ek"></canvas></div>
+  </div>
+  <div class="chart-card" data-page-node-id="pUOZLb152qOfmAOhetznjV">
+    <h3 data-page-node-id="ENSty1rBDoo4tb6dynHb8L">模型分布 (Model)</h3>
+    <div class="chart-wrap" data-page-node-id="S3HrXTJy3l5QwFNfQ2sTmi"><canvas id="chartModel" data-page-node-id="ue2hJD7wMJtJpHSLrmmDyc"></canvas></div>
+  </div>
+  <div class="chart-card" data-page-node-id="1Z3AbYzudltsWl2bbDH2mW">
+    <h3 data-page-node-id="NYTp46h6D8o36Wn5SsIeuJ">任务类型分布 (Task Type)</h3>
+    <div class="chart-wrap" data-page-node-id="7yM2hPm2TPPaMtbP94JmF7"><canvas id="chartTaskType" data-page-node-id="QFt54XM31OFCMtCjBlPyg4"></canvas></div>
+  </div>
+  <div class="chart-card wide" data-page-node-id="kFsDFZ443uwAKEsHaMP3Ty">
+    <h3 data-page-node-id="tWiezhSe6iPruwKvFBIcgG">最近请求量趋势（按小时，北京时间）</h3>
+    <div class="chart-wrap" data-page-node-id="4zJsmZM788xYxQcFAeHeah"><canvas id="chartHourly" data-page-node-id="DRhCfRQ4iy4PM7qlFvtJNT"></canvas></div>
+  </div>
+</div>
+
+<script>
+let charts = {};
+
+// 配色（暗色主题友好）
+const PALETTE = ['#38bdf8', '#34d399', '#fbbf24', '#f87171', '#a78bfa', '#f472b6', '#2dd4bf', '#fb923c'];
+
+function initCharts() {
+  const pieOpts = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { position: 'bottom', labels: { color: '#cbd5e1', boxWidth: 12, padding: 12 } }
+    }
+  };
+  const ctxProvider = document.getElementById('chartProvider').getContext('2d');
+  const ctxModel = document.getElementById('chartModel').getContext('2d');
+  const ctxTask = document.getElementById('chartTaskType').getContext('2d');
+  const ctxHourly = document.getElementById('chartHourly').getContext('2d');
+
+  charts.provider = new Chart(ctxProvider, { type: 'doughnut', data: { labels: [], datasets: [{ data: [], backgroundColor: [] }] }, options: pieOpts });
+  charts.model = new Chart(ctxModel, { type: 'doughnut', data: { labels: [], datasets: [{ data: [], backgroundColor: [] }] }, options: pieOpts });
+  charts.task = new Chart(ctxTask, { type: 'doughnut', data: { labels: [], datasets: [{ data: [], backgroundColor: [] }] }, options: pieOpts });
+  charts.hourly = new Chart(ctxHourly, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        label: '请求量',
+        data: [],
+        borderColor: '#38bdf8',
+        backgroundColor: 'rgba(56,189,248,.15)',
+        fill: true,
+        tension: .3,
+        pointRadius: 2
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#94a3b8', maxRotation: 45 }, grid: { color: 'rgba(148,163,184,.12)' } },
+        y: { ticks: { color: '#94a3b8', precision: 0 }, grid: { color: 'rgba(148,163,184,.12)' }, beginAtZero: true }
+      }
+    }
+  });
+}
+
+function updateDoughnut(chart, dist) {
+  const entries = Object.entries(dist || {});
+  if (!entries.length) {
+    chart.data.labels = ['暂无数据'];
+    chart.data.datasets[0].data = [1];
+    chart.data.datasets[0].backgroundColor = ['rgba(148,163,184,.3)'];
+    chart.update();
+    return;
+  }
+  chart.data.labels = entries.map(([k]) => k);
+  chart.data.datasets[0].data = entries.map(([, v]) => v);
+  chart.data.datasets[0].backgroundColor = entries.map((_, i) => PALETTE[i % PALETTE.length]);
+  chart.update();
+}
+
+function fmtNum(n) {
+  if (n === null || n === undefined) return '-';
+  return n.toLocaleString('en-US');
+}
+
+async function loadStats() {
+  const btn = document.getElementById('btnRefresh');
+  const banner = document.getElementById('errorBanner');
+  btn.disabled = true;
+  banner.style.display = 'none';
+
+  const range = document.getElementById('timeRange').value;
+  try {
+    const resp = await fetch('/router/stats?time_range=' + encodeURIComponent(range));
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const d = await resp.json();
+
+    // KPI
+    document.getElementById('kpiTotal').textContent = fmtNum(d.total_requests);
+    document.getElementById('kpiTotalSub').textContent = 'free ' + fmtNum(d.free_count) + ' / paid ' + fmtNum(d.paid_count);
+    document.getElementById('kpiSuccessRate').textContent = (d.success_rate * 100).toFixed(1) + '%';
+    document.getElementById('kpiSuccessCount').textContent = fmtNum(d.success_count);
+    document.getElementById('kpiFailCount').textContent = fmtNum(d.fail_count);
+    document.getElementById('kpiFreeRatio').textContent = (d.free_ratio * 100).toFixed(1) + '%';
+    document.getElementById('kpiFreeCount').textContent = fmtNum(d.free_count);
+    document.getElementById('kpiPaidCount').textContent = fmtNum(d.paid_count);
+    document.getElementById('kpiLatency').textContent = fmtNum(Math.round(d.avg_latency_ms));
+    document.getElementById('kpiFallback').textContent = fmtNum(d.fallback_count);
+
+    // 饼图
+    updateDoughnut(charts.provider, d.provider_distribution);
+    updateDoughnut(charts.model, d.model_distribution);
+    updateDoughnut(charts.task, d.task_type_distribution);
+
+    // 折线图
+    const hourly = d.hourly_requests || [];
+    charts.hourly.data.labels = hourly.map(h => {
+      // UTC 时间字符串 "2026-09-05T03" → 北京时间 (UTC+8)
+      const utc = new Date(h.hour + ':00:00Z');
+      const bj = new Date(utc.getTime() + 8 * 60 * 60 * 1000);
+      return bj.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false });
+    }); // 北京时间 MM-DD HH
+    charts.hourly.data.datasets[0].data = hourly.map(h => h.count);
+    charts.hourly.update();
+
+    document.getElementById('lastUpdated').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  } catch (e) {
+    banner.textContent = '加载失败：' + e.message;
+    banner.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// 初次加载
+initCharts();
+loadStats();
+</script>
+</body>
+</html>
