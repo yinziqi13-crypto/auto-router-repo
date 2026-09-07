@@ -316,84 +316,212 @@ cat /opt/ai-hub/auto-router/router/config.json | python3 -c "import sys,json; d=
 cat /opt/ai-hub/auto-router/router/config.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['provider_models']['tencent_free'])"
 ```
 
-### 6.4 router.db 路径错误 / 数据库损坏
+### 6.4 router.db 路径错误 / 数据库损坏（紧急恢复）
 
-**现象**：启动时报 `aiosqlite.Error` 或决策日志全为空
+**现象**：启动时报 `aiosqlite.Error` 或决策日志全为空。
+
+**原则**：先保全完整现场，再在副本上诊断，不要直接删除生产数据库文件。
 
 ```bash
-# 查文件是否存在
-ls -la /opt/ai-hub/auto-router/router/router.db
+# 1. 停服务
+pkill -f "uvicorn router.main:app --host 127.0.0.1 --port 8080" || true
+sleep 3
 
-# 不存在 → 重启自动创建（空库）
-# 存在但损坏 → 备份后删除，重启重建
-cp /opt/ai-hub/auto-router/router/router.db /tmp/router.db.bak.$(date +%Y%m%d)
-rm /opt/ai-hub/auto-router/router/router.db
-# 重启服务（会自动创建新表结构）
+# 2. 保全完整数据库文件集（主库 + WAL + SHM）
+TS=$(date +%Y%m%d_%H%M%S)
+mkdir -p /tmp/router.db.rescue.$TS
+cp /opt/ai-hub/auto-router/router/router.db* /tmp/router.db.rescue.$TS/
+
+# 3. 在副本上诊断是否可打开
+sqlite3 /tmp/router.db.rescue.$TS/router.db "PRAGMA integrity_check;"
+# 输出 "ok" 表示主库完整；否则需要进一步恢复
+
+# 4. 如果主库完整但缺少 WAL/SHM，可尝试用 SQLite 自带恢复
+#    SQLite 会在打开时自动处理残留 WAL，通常能恢复到最后一次提交
+sqlite3 /tmp/router.db.rescue.$TS/router.db "PRAGMA wal_checkpoint(TRUNCATE);"
+
+# 5. 只有确认主库无法修复时，才放弃历史数据重建空库
+#    mv /opt/ai-hub/auto-router/router/router.db /tmp/router.db.corrupt.$TS
+#    重启服务会自动创建新表结构
 ```
 
 > ⚠️ **教训**：M2 部署 tar 包必须排除 `*.db*`，否则覆盖 router.db 导致历史决策日志丢失！
 
-### 6.5 SQLite WAL/SHM 文件处理
+### 6.5 SQLite WAL/SHM 与数据库运维
 
-**背景**：aiosqlite 默认启用 WAL（Write-Ahead Logging）模式，数据库目录下会出现 3 个文件：
+**背景**：aiosqlite 默认启用 WAL（Write-Ahead Logging）模式。WAL 中可能包含**已经提交、但尚未写回主文件**的数据，不是普通缓存。SQLite 官方说明：提交先发生在 WAL，checkpoint 再将内容写回主库。因此：
+
+- 不能只复制主库而丢弃 WAL/SHM
+- 不能在服务运行时直接打包数据库
+- 不能把 WAL/SHM 当作可删除的临时文件
+
+数据库目录下会出现 3 个文件：
 
 | 文件 | 说明 |
 |---|---|
 | `router.db` | 主数据库文件 |
-| `router.db-wal` | WAL 日志（未提交事务暂存） |
-| `router.db-shm` | 共享内存索引（加速 WAL 读取） |
+| `router.db-wal` | WAL 日志（含已提交但未 checkpoint 的数据） |
+| `router.db-shm` | 共享内存索引（WAL 读取加速） |
 
-**正常运行时不需要干预**，但以下场景需注意：
+以下按三种运维场景分别给出流程。
 
-#### 6.5.1 部署/备份时排除 WAL/SHM
+#### 场景 A：代码部署（不动数据库）
+
+**目标**：只更新代码、静态资源和示例配置，不覆盖/迁移数据库。
 
 ```bash
-# 打 tar 包时排除 WAL/SHM（防止在另一台机器上恢复出脏数据）
+# 部署包必须排除全部数据库运行文件
 tar czf auto-router-deploy.tar.gz \
-  --exclude='*.db-wal' --exclude='*.db-shm' \
-  -C /opt/ai-hub/auto-router router/
+  --exclude='*.db' --exclude='*.db-wal' --exclude='*.db-shm' \
+  -C /opt/ai-hub/auto-router router/ tests/ pyproject.toml requirements.txt
 
-# 备份数据库时先 checkpoint 再复制（将 WAL 写入主库）
-sqlite3 /opt/ai-hub/auto-router/router/router.db "PRAGMA wal_checkpoint(TRUNCATE);"
-cp /opt/ai-hub/auto-router/router/router.db /tmp/router.db.bak.$(date +%Y%m%d)
+# 解压覆盖代码后重启服务，数据库保持原样
 ```
 
-#### 6.5.2 数据库搬迁后 WAL 残留
+> 禁止：把 `router.db` 及其 `-wal`/`-shm` 打进部署包，或在部署脚本里 `rm` 掉这些文件。
 
-**现象**：把 `router.db` 复制到新机器，但忘了 `-wal`/`-shm`，启动后丢失最近未 checkpoint 的事务。
+#### 场景 B：数据库备份与恢复
 
-```bash
-# 检查 WAL 中是否有未提交事务
-sqlite3 /opt/ai-hub/auto-router/router/router.db "PRAGMA wal_checkpoint(PASSIVE);"
-# 输出 0|N|N 表示 WAL 为空，安全
-# 输出非 0 表示有未 checkpoint 数据
+**目标**：获得一个可随时恢复、数据一致的数据库副本。
 
-# 如果搬迁时只带了 router.db（无 wal/shm），数据会回退到最后一次 checkpoint
-# 恢复方法：无法恢复，需重新积累决策数据
-# 预防：搬迁前先执行 wal_checkpoint(TRUNCATE)
-```
-
-#### 6.5.3 强制清理 WAL（紧急恢复）
-
-**仅在数据库损坏时使用**，正常情况勿用：
+**推荐做法（使用 SQLite 内置 backup API）**：
 
 ```bash
-# 停服务
-kill $(pgrep -f "uvicorn.*auto-router") 2>/dev/null
+# 1. 停服务，确保无写入
+pkill -f "uvicorn router.main:app --host 127.0.0.1 --port 8080" || true
+sleep 3
 
-# 删除 WAL/SHM（会丢失未提交事务，主库数据不受影响）
-rm -f /opt/ai-hub/auto-router/router/router.db-wal
-rm -f /opt/ai-hub/auto-router/router/router.db-shm
-
-# 重启
+# 2. 执行在线一致性备份（SQLite backup API，不依赖 checkpoint 时机）
 cd /opt/ai-hub/auto-router
-nohup ./venv/bin/python -m uvicorn router.main:app \
-  --host 127.0.0.1 --port 8080 \
-  > /tmp/auto-router.log 2>&1 &
-disown
+./venv/bin/python - << 'PY'
+import sqlite3
+src = 'router/router.db'
+dst = '/tmp/router.db.bak.' + __import__('datetime').datetime.now().strftime('%Y%m%d_%H%M%S') + '.db'
+with sqlite3.connect(src) as s:
+    with sqlite3.connect(dst) as d:
+        s.backup(d)
+print(f"backup done: {dst}")
+PY
+
+# 3. 启动服务
+cd /opt/ai-hub/auto-router
+setsid nohup ./venv/bin/python -m uvicorn router.main:app \
+  --host 127.0.0.1 --port 8080 > /tmp/auto-router.log 2>&1 < /dev/null &
 ```
 
-> ⚠️ WAL/SHM 是运行时缓存文件，删除后 SQLite 会自动重建。但未 checkpoint 的事务会丢失。
+**替代做法（命令行 checkpoint + 停写复制）**：
+
+```bash
+# 1. 停服务
+pkill -f "uvicorn router.main:app --host 127.0.0.1 --port 8080" || true
+sleep 3
+
+# 2. checkpoint 并确认完成
+sqlite3 /opt/ai-hub/auto-router/router/router.db "PRAGMA wal_checkpoint(TRUNCATE);"
+
+# 3. 复制主库（此时 WAL 已空，复制主库即完整）
+TS=$(date +%Y%m%d_%H%M%S)
+cp /opt/ai-hub/auto-router/router/router.db /tmp/router.db.bak.$TS.db
+
+# 4. 启动服务
+```
+
+**恢复验证流程**：
+
+```bash
+# 1. 再次停服务
+pkill -f "uvicorn router.main:app --host 127.0.0.1 --port 8080" || true
+sleep 3
+
+# 2. 移动原库（保留）
+mv /opt/ai-hub/auto-router/router/router.db /tmp/router.db.before_restore
+mv /opt/ai-hub/auto-router/router/router.db-wal /tmp/router.db-wal.before_restore 2>/dev/null || true
+mv /opt/ai-hub/auto-router/router/router.db-shm /tmp/router.db-shm.before_restore 2>/dev/null || true
+
+# 3. 从备份恢复（用 backup API 比 cp 更能保证一致性）
+/opt/ai-hub/auto-router/venv/bin/python - << 'PY'
+import sqlite3
+src = '/tmp/router.db.bak.YYYYMMDD_HHMMSS.db'  # 替换为实际备份路径
+dst = '/opt/ai-hub/auto-router/router/router.db'
+with sqlite3.connect(src) as s:
+    with sqlite3.connect(dst) as d:
+        s.backup(d)
+print(f"restore done: {dst}")
+PY
+
+# 4. 启动服务并核对数据
+cd /opt/ai-hub/auto-router
+setsid nohup ./venv/bin/python -m uvicorn router.main:app \
+  --host 127.0.0.1 --port 8080 > /tmp/auto-router.log 2>&1 < /dev/null &
+sleep 5
+curl -s http://127.0.0.1:8080/router/decisions?limit=1 | python3 -m json.tool
+```
+
+#### 场景 C：数据库搬迁
+
+**目标**：把数据库从一台机器搬到另一台机器。
+
+```bash
+# 源机器：停服务后备份完整文件集
+pkill -f "uvicorn router.main:app --host 127.0.0.1 --port 8080" || true
+sleep 3
+mkdir -p /tmp/router-db-export
+cp /opt/ai-hub/auto-router/router/router.db* /tmp/router-db-export/
+
+# 把 /tmp/router-db-export 传输到目标机器
+# 目标机器：直接放到 router/ 目录下启动即可
+# SQLite 会在打开时自动处理 WAL/SHM
+```
+
+**禁止**：只复制 `router.db` 而不带 `-wal`/`-shm`。如果这么做，数据会回退到最后一次 checkpoint，期间已提交的决策记录可能丢失。
+
+#### 场景 D：强制清理 WAL/SHM（仅限数据库损坏无法打开）
+
+**仅在以下情况使用**：
+- 数据库文件损坏，无法正常打开
+- 已按场景 C 保全完整文件集
+- 在副本上诊断后确认需要清理
+
+```bash
+# 1. 先停服务
+pkill -f "uvicorn router.main:app --host 127.0.0.1 --port 8080" || true
+sleep 3
+
+# 2. 保全完整现场
+TS=$(date +%Y%m%d_%H%M%S)
+mkdir -p /tmp/router.db.rescue.$TS
+cp /opt/ai-hub/auto-router/router/router.db* /tmp/router.db.rescue.$TS/
+
+# 3. 在副本上尝试打开并 checkpoint
+sqlite3 /tmp/router.db.rescue.$TS/router.db "PRAGMA wal_checkpoint(TRUNCATE);"
+
+# 4. 如果副本能正常打开，再用副本替换生产文件
+#    不要直接在生产目录删除 WAL/SHM
+```
+
+> ⚠️ **绝对禁止**：服务运行中直接 `rm -f router.db-wal router.db-shm`。这会破坏正在进行的事务，导致数据库损坏。
+
+#### 备份恢复演练记录（M2.5 复核）
+
+**时间**：2026-09-07
+**环境**：M0 验证环境 `/opt/ai-hub/auto-router/router/router.db`
+**步骤与结果**：
+
+```bash
+# 备份前记录数
+sqlite3 router.db "SELECT COUNT(*) FROM router_decision_event WHERE original_model='deepseek-v4-pro';"
+# → 3
+
+# 停服务 → SQLite backup API 备份 → 移动原库 → 从备份恢复 → 启动服务
+
+# 恢复后记录数
+sqlite3 router.db "SELECT COUNT(*) FROM router_decision_event WHERE original_model='deepseek-v4-pro';"
+# → 3
+
+# /health 检查：200 OK
+```
+
+**结论**：backup API 备份 + 恢复后数据一致，服务可正常启动。
 
 ### 6.6 venv 损坏（Python 依赖缺失）
 

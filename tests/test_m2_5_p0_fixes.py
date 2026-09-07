@@ -20,11 +20,15 @@ from router.providers import ProviderRegistry, NewAPIProvider
 # ─────────────────────────────────────────
 
 class FakeState:
-    """可控额度状态：exhausted 集合内的 (provider, model) 返回 EXHAUSTED"""
+    """可控额度状态：exhausted 集合内的 (provider, model) 返回 EXHAUSTED。
+
+    同时模拟真实 StateManager 的 402 累计行为：连续 3 次后自动进入 EXHAUSTED。
+    """
 
     def __init__(self, exhausted=frozenset()):
-        self.exhausted = exhausted
+        self.exhausted = set(exhausted)
         self.recorded_402 = []
+        self._counts: Dict[Tuple[str, str], int] = {}
 
     def get_status(self, provider, model):
         return (
@@ -35,6 +39,33 @@ class FakeState:
 
     async def record_402(self, provider, model):
         self.recorded_402.append((provider, model))
+        key = (provider, model)
+        self._counts[key] = self._counts.get(key, 0) + 1
+        if self._counts[key] >= 3:
+            self.exhausted.add(key)
+
+
+class FakeStreamResponse:
+    """模拟 httpx.Response 的最小流式响应，供 FakeTransport.open_stream 返回。"""
+
+    def __init__(self, status_code: int, body: bytes = b"data: ok\n\n"):
+        self.status_code = status_code
+        self._body = body
+        self._read = False
+
+    async def aread(self) -> bytes:
+        self._read = True
+        return self._body
+
+    async def aiter_bytes(self):
+        if not self._read:
+            # 模拟分块返回
+            chunk_size = 8
+            for i in range(0, len(self._body), chunk_size):
+                yield self._body[i:i + chunk_size]
+
+    async def aclose(self):
+        pass
 
 
 class FakeTransport:
@@ -44,10 +75,12 @@ class FakeTransport:
     这样 business provider → transport 的映射逻辑仍然被真实执行。
     """
 
-    def __init__(self, responses):
-        self.responses = list(responses)
-        self.calls = []          # 每次 forward 收到的 token
-        self.requests = []
+    def __init__(self, responses=None, stream_responses=None):
+        self.responses = list(responses or [])
+        self.stream_responses = list(stream_responses or [])
+        self.calls = []          # 每次 forward/open_stream 收到的 token
+        self.requests = []       # 每次 forward 收到的 request
+        self.stream_requests = []  # 每次 open_stream 收到的 request
 
     async def forward(self, token, request, model_mapping=None):
         self.calls.append(token)
@@ -68,7 +101,15 @@ class FakeTransport:
         raise NotImplementedError
 
     async def open_stream(self, token, request, model_mapping=None):
-        raise NotImplementedError
+        self.calls.append(token)
+        self.stream_requests.append(request)
+        if self.stream_responses:
+            status, body = self.stream_responses.pop(0)
+        else:
+            status, body = 200, b"data: ok\n\n"
+        if isinstance(body, str):
+            body = body.encode()
+        return FakeStreamResponse(status, body)
 
     async def health_check(self):
         return True
@@ -224,6 +265,35 @@ class Test402Retry:
 
 
 # ─────────────────────────────────────────
+# M2.5-R2：free-only 模型 402 额度状态更新
+# ─────────────────────────────────────────
+
+class TestFreeOnly402State:
+    async def test_free_only_402_counts_toward_exhausted(self):
+        """free-only 模型连续 3 次 402 后，第 4 次直接 503 不再访问上游。"""
+        state = FakeState()
+        # 4 次都返回 402，但第 4 次不应被调用
+        transport = FakeTransport([(402, None)] * 3)
+        eng = build_engine(state, transport)
+
+        # 前 3 次：每次访问上游并记录 402
+        for i in range(3):
+            resp, _ = await eng.route(req("free-only-model"))
+            assert resp["status_code"] == 402, f"第 {i + 1} 次应返回 402"
+
+        # 第 4 次：应直接 503，不访问上游
+        transport.calls.clear()
+        resp, decision = await eng.route(req("free-only-model"))
+        assert resp["status_code"] == 503, "第 4 次应直接 503"
+        assert transport.calls == [], "第 4 次不应再访问上游"
+        assert state.recorded_402 == [
+            ("tencent_free", "free-only-model"),
+            ("tencent_free", "free-only-model"),
+            ("tencent_free", "free-only-model"),
+        ], "前 3 次 402 都应被记录"
+
+
+# ─────────────────────────────────────────
 # W2：OpenAI 协议兼容（P0-7）
 # ─────────────────────────────────────────
 
@@ -304,3 +374,99 @@ class TestStreamInterface:
         eng = build_engine(FakeState(), FakeTransport([]))
         assert hasattr(eng, "route_stream")
         assert hasattr(eng, "_sse_error")
+
+
+# ─────────────────────────────────────────
+# M2.5-R1：流式路径在 StreamingResponse 之前检查上游状态
+# ─────────────────────────────────────────
+
+class TestStreamRouteSetup:
+    async def test_stream_upstream_500_returns_error_before_yield(self):
+        """上游 500 时 stream_route_setup 应返回 error，不返回生成器。"""
+        transport = FakeTransport(stream_responses=[(500, b"server error")])
+        eng = build_engine(FakeState(), transport)
+        generator, error, decision = await eng.stream_route_setup(req("deepseek-v4-pro"))
+        assert generator is None
+        assert error is not None
+        assert error["status_code"] == 500
+        assert decision.selected_token == "paid"
+
+    async def test_stream_free_402_then_paid_500_returns_error(self):
+        """free 402 → paid 500，最终应返回 500 错误。"""
+        transport = FakeTransport(stream_responses=[(402, b"exhausted"), (500, b"bad")])
+        eng = build_engine(FakeState(), transport)
+        generator, error, decision = await eng.stream_route_setup(req("deepseek-v4-flash"))
+        assert generator is None
+        assert error["status_code"] == 500
+        assert transport.calls == ["sk-free-test", "sk-paid-test"]
+        assert decision.selected_token == "paid"
+
+    async def test_stream_free_402_then_paid_200_returns_generator(self):
+        """free 402 → paid 200，应返回生成器，可正常迭代 SSE。"""
+        transport = FakeTransport(stream_responses=[
+            (402, b"exhausted"),
+            (200, b"data: {\"ok\": true}\n\n"),
+        ])
+        eng = build_engine(FakeState(), transport)
+        generator, error, decision = await eng.stream_route_setup(req("deepseek-v4-flash"))
+        assert generator is not None
+        assert error is None
+        assert transport.calls == ["sk-free-test", "sk-paid-test"]
+        chunks = []
+        async for chunk in generator:
+            chunks.append(chunk)
+        assert b"data:" in b"".join(chunks)
+
+    async def test_stream_connection_failure_returns_502(self):
+        """open_stream 抛异常时，应返回 502 错误。"""
+        class ExplodingTransport(FakeTransport):
+            async def open_stream(self, token, request, model_mapping=None):
+                raise ConnectionError("upstream down")
+
+        eng = build_engine(FakeState(), ExplodingTransport())
+        generator, error, decision = await eng.stream_route_setup(req("deepseek-v4-pro"))
+        assert generator is None
+        assert error["status_code"] == 502
+
+
+# ─────────────────────────────────────────
+# M2.5-R3：默认关键词表不随请求增长
+# ─────────────────────────────────────────
+
+class TestTaskKeywordsStable:
+    def test_keywords_do_not_grow_after_many_calls(self):
+        """连续调用 _detect_task_type 100 次，全局 DEFAULT_TASK_KEYWORDS 长度不变。"""
+        from router.decision import DEFAULT_TASK_KEYWORDS, DecisionEngine
+        eng = build_engine(FakeState(), FakeTransport([]))
+        original_len = {k: len(v) for k, v in DEFAULT_TASK_KEYWORDS.items()}
+        custom_cfg = make_cfg()
+        custom_cfg.three_pool_keywords = {"vision": ["新增词"]}
+        eng_custom = DecisionEngine(
+            state_manager=FakeState(),
+            config=custom_cfg,
+            provider_registry=eng._provider_registry,
+        )
+        for _ in range(100):
+            eng_custom._detect_task_type(req("auto-free"))
+        for k, ln in original_len.items():
+            assert len(DEFAULT_TASK_KEYWORDS[k]) == ln, f"DEFAULT_TASK_KEYWORDS['{k}'] 被污染"
+
+
+# ─────────────────────────────────────────
+# M2.5-R4：直接调用引擎时 __pydantic_extra__ 不丢失
+# ─────────────────────────────────────────
+
+class TestDirectEngineExtraFields:
+    async def test_tools_passed_through_route(self):
+        """直接构造 ChatCompletionRequest(..., tools=...) 调用 route()，tools 应到达上游 payload。"""
+        transport = FakeTransport([(200, {"ok": True})])
+        eng = build_engine(FakeState(), transport)
+        r = ChatCompletionRequest(
+            model="deepseek-v4-flash",
+            messages=[ChatMessage(role="user", content="hi")],
+            tools=[{"type": "function", "function": {"name": "fn"}}],
+        )
+        await eng.route(r)
+        forwarded = transport.requests[0]
+        payload = forwarded.model_dump()
+        assert "tools" in payload, "tools 应保留在转发请求中"

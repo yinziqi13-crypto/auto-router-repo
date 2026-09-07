@@ -290,8 +290,8 @@ async def chat_completions(
             content={"error": resp["error"] or "upstream error"},
         )
 
-    # ── 流式：先决策并检查错误，再创建 StreamingResponse ──
-    # 必须在响应头发出之前判断，否则 HTTP 已经是 200 无法再改状态码
+    # ── 流式：先决策、再打开上游并检查状态码，最后才创建 StreamingResponse ──
+    # M2.5-R1：必须在响应头发出之前判断上游状态，否则 HTTP 200 后无法改状态码。
     decision = await eng.decide(chat_req)
     if decision.error_code:
         return JSONResponse(
@@ -302,8 +302,18 @@ async def chat_completions(
             }},
         )
 
+    generator, error, decision = await eng.stream_route_setup(chat_req, decision)
+    if error:
+        return JSONResponse(
+            status_code=error["status_code"],
+            content={"error": {
+                "message": error["error"],
+                "type": "upstream_error",
+            }},
+        )
+
     return StreamingResponse(
-        eng.route_stream(chat_req, decision),
+        generator,
         media_type="text/event-stream",
     )
 

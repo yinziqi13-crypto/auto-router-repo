@@ -16,6 +16,7 @@ Decision Engine — 决策引擎（M1-1 ~ M1-6 修复版）
 import uuid
 import json
 import logging
+import copy
 from datetime import datetime
 from typing import Optional, Tuple, Dict, Any, List, AsyncGenerator
 
@@ -143,6 +144,17 @@ class DecisionEngine:
         for pname in (config.provider_models or {}).keys():
             # 默认走 new_api transport
             self._provider_transport[pname] = "new_api"
+
+        # M2.5-R3：在初始化时构建独立、去重的任务关键词表，避免每次请求时
+        # 用 dict(DEFAULT_TASK_KEYWORDS) 浅拷贝 + extend 污染全局列表。
+        self._task_keywords: Dict[str, List[str]] = copy.deepcopy(DEFAULT_TASK_KEYWORDS)
+        cfg_kw = self.config.three_pool_keywords or {}
+        for task_type, kw_list in cfg_kw.items():
+            existing = set(self._task_keywords.get(task_type, []))
+            for kw in (kw_list or []):
+                if kw not in existing:
+                    self._task_keywords.setdefault(task_type, []).append(kw)
+                    existing.add(kw)
 
     # ── 公共：选 provider（纯候选匹配，不过滤 exhausted）─┤
 
@@ -400,15 +412,13 @@ class DecisionEngine:
                     logger.warning(f"[Decision] failed to write decision event: {e}")
             return err_resp, decision
 
-        # M2-3：构造转发请求（用 logical_model 替代 original_model 做后续路由）
-        forward_req = ChatCompletionRequest(
-            model=logical_model,
-            messages=request.messages,
-            stream=request.stream,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            extra=request.extra,
-        )
+        # M2.5-R4：构造转发请求时保留所有字段（含 __pydantic_extra__）。
+        # 重建方式：先 model_dump 再覆盖 model/stream，确保 tools / tool_choice
+        # 等通过 extra="allow" 捕获的未知字段不丢失。
+        req_data = request.model_dump()
+        req_data["model"] = logical_model
+        req_data["stream"] = request.stream
+        forward_req = ChatCompletionRequest(**req_data)
 
         # 状态 B/C：直接用 paid token 转发，不做 free 尝试
         if initial_token == "paid":
@@ -458,44 +468,46 @@ class DecisionEngine:
         resp = await _prov.forward(token_free, forward_req, mapping_free)
         decision.latency_ms = resp["latency_ms"]
 
-        # 检查 402（走到这里只可能是状态 A：已用 free token 打过一次）
-        if resp["status_code"] == 402 and paid_candidates:
-            provider_paid = paid_candidates[0]
-            logger.info(
-                f"[Decision] 402 from {provider_selected}, "
-                f"switching to paid provider {provider_paid}"
-            )
-            decision.fallback_reason = "402_exhausted"
-            decision.selected_provider = provider_paid
-            decision.selected_token = "paid"
-
-            # 标记状态
+        # M2.5-R2：402 必须无条件记录，再判断是否有 paid 候选可重试。
+        # 否则 free-only 模型永远不清零/不耗尽，D 态无法通过真实 402 序列到达。
+        if resp["status_code"] == 402:
             await self.state.record_402(provider_selected, logical_model)
 
-            # 换 paid token 重试 1 次（仅限 402 场景）
-            token_paid = self.config.token_paid
-            mapping_paid = self.config.model_mapping.get(provider_paid, {})
+            # 检查 402（走到这里只可能是状态 A：已用 free token 打过一次）
+            if paid_candidates:
+                provider_paid = paid_candidates[0]
+                logger.info(
+                    f"[Decision] 402 from {provider_selected}, "
+                    f"switching to paid provider {provider_paid}"
+                )
+                decision.fallback_reason = "402_exhausted"
+                decision.selected_provider = provider_paid
+                decision.selected_token = "paid"
 
-            # M2.5-W1（P0-2）：必须用 _get_provider() 完成
-            # business provider → transport 映射。此前直接查 registry，
-            # 而业务名（tencent_plan 等）不在注册表里，必然返回 None → 500
-            _prov2 = self._get_provider(provider_paid)
-            if _prov2 is None:
-                logger.error(f"[Decision] provider '{provider_paid}' not registered for 402 retry")
-                resp = {
-                    "status_code": 500,
-                    "body": None,
-                    "error": f"provider '{provider_paid}' not registered",
-                    "latency_ms": 0,
-                }
-            else:
-                start = datetime.utcnow()
-                resp = await _prov2.forward(token_paid, forward_req, mapping_paid)
-                latency = (datetime.utcnow() - start).total_seconds() * 1000
-                decision.latency_ms = latency
-            decision.quota_status_before = self.state.get_status(
-                provider_paid, logical_model
-            )
+                # 换 paid token 重试 1 次（仅限 402 场景）
+                token_paid = self.config.token_paid
+                mapping_paid = self.config.model_mapping.get(provider_paid, {})
+
+                # M2.5-W1（P0-2）：必须用 _get_provider() 完成
+                # business provider → transport 映射。此前直接查 registry，
+                # 而业务名（tencent_plan 等）不在注册表里，必然返回 None → 500
+                _prov2 = self._get_provider(provider_paid)
+                if _prov2 is None:
+                    logger.error(f"[Decision] provider '{provider_paid}' not registered for 402 retry")
+                    resp = {
+                        "status_code": 500,
+                        "body": None,
+                        "error": f"provider '{provider_paid}' not registered",
+                        "latency_ms": 0,
+                    }
+                else:
+                    start = datetime.utcnow()
+                    resp = await _prov2.forward(token_paid, forward_req, mapping_paid)
+                    latency = (datetime.utcnow() - start).total_seconds() * 1000
+                    decision.latency_ms = latency
+                decision.quota_status_before = self.state.get_status(
+                    provider_paid, logical_model
+                )
 
         # 记录 decision event
         decision.success = resp["status_code"] == 200
@@ -511,28 +523,30 @@ class DecisionEngine:
 
         return resp, decision
 
-    # ── M2.5-W6（P0-5）：流式路由 + 402 降级 ──┤
+    # ── M2.5-W6（P0-5）+ R1：流式路由 + 402 降级 ──┤
 
-    async def route_stream(
+    async def stream_route_setup(
         self,
         request: ChatCompletionRequest,
         decision: Optional[RouterDecisionEventRecord] = None,
-    ) -> AsyncGenerator[bytes, None]:
-        """流式路由：在向客户端发出首个 chunk 之前检查上游状态，遇 402 换 paid 重试一次。
+    ) -> Tuple[Optional[AsyncGenerator[bytes, None]], Optional[Dict[str, Any]], RouterDecisionEventRecord]:
+        """M2.5-R1：在创建 StreamingResponse 之前完成上游流式连接打开、
+        状态码检查和允许的一次 402 降级。只有在确认上游成功后才返回
+        字节生成器；否则返回 error dict，由调用方转换为正确的 HTTP 响应。
 
-        用法（main.py）：
-            decision = await eng.decide(chat_req)
-            if decision.error_code:      # 必须在创建 StreamingResponse 之前判断
-                return JSONResponse(...)
-            return StreamingResponse(eng.route_stream(chat_req, decision), ...)
-
-        与定稿规格 4 的差异（已修正）：
-        规格伪代码让 route_stream 直接返回 generator，但那样 D/E 态的错误
-        只能在 generator 内部 yield —— 此时 HTTP 200 已经发出，状态码改不了。
-        故改为「先 decide 检查 → 再创建 generator」两段式。
+        返回: (generator, error, decision)
+        - 成功: generator 不为 None, error 为 None
+        - 失败: generator 为 None, error 为 {"status_code": int, "error": str}
         """
         if decision is None:
             decision = await self.decide(request)
+
+        # D/E 态已由调用方在 decide 后处理，此处兜底
+        if decision.error_code:
+            return None, {
+                "status_code": decision.error_code,
+                "error": decision.error_message or "routing failed",
+            }, decision
 
         logical_model = decision.logical_model
         sel = self._select_pool(logical_model)
@@ -544,72 +558,99 @@ class DecisionEngine:
             else self.config.token_paid
         )
 
-        stream_req = ChatCompletionRequest(
-            model=logical_model,
-            messages=request.messages,
-            stream=True,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            extra=request.extra,
-        )
+        # M2.5-R4：保留所有字段（含 __pydantic_extra__）
+        req_data = request.model_dump()
+        req_data["model"] = logical_model
+        req_data["stream"] = True
+        stream_req = ChatCompletionRequest(**req_data)
 
         provider = self._get_provider(decision.selected_provider)
         if provider is None:
-            yield self._sse_error(f"no provider for '{decision.selected_provider}'")
-            return
+            return None, {
+                "status_code": 500,
+                "error": f"provider '{decision.selected_provider}' not registered",
+            }, decision
 
         mapping = self.config.model_mapping.get(decision.selected_provider, {})
         resp = None
         try:
             resp = await provider.open_stream(token, stream_req, mapping)
 
-            # 关键：在 yield 任何数据之前检查状态码
-            if (
-                resp.status_code == 402
-                and decision.selected_token == "free"
-                and paid_candidates
-            ):
-                # 必须记录，否则下次请求仍要先打一次 free 付 402 探测代价
-                await self.state.record_402(
-                    decision.selected_provider, logical_model
-                )
+            # 402 降级：仅 free token 场景
+            if resp.status_code == 402 and decision.selected_token == "free":
+                # M2.5-R2：无条件记录 402，再判断是否有 paid 候选可重试
+                await self.state.record_402(decision.selected_provider, logical_model)
                 await resp.aclose()
                 resp = None
 
-                provider_paid = paid_candidates[0]
-                decision.selected_provider = provider_paid
-                decision.selected_token = "paid"
-                decision.fallback_reason = "402_streaming"
+                if paid_candidates:
+                    provider_paid = paid_candidates[0]
+                    decision.selected_provider = provider_paid
+                    decision.selected_token = "paid"
+                    decision.fallback_reason = "402_streaming"
 
-                provider = self._get_provider(provider_paid)
-                mapping_paid = self.config.model_mapping.get(provider_paid, {})
-                resp = await provider.open_stream(
-                    self.config.token_paid, stream_req, mapping_paid
-                )
+                    provider = self._get_provider(provider_paid)
+                    if provider is None:
+                        return None, {
+                            "status_code": 500,
+                            "error": f"provider '{provider_paid}' not registered",
+                        }, decision
+                    mapping_paid = self.config.model_mapping.get(provider_paid, {})
+                    resp = await provider.open_stream(
+                        self.config.token_paid, stream_req, mapping_paid
+                    )
+                else:
+                    # 无 paid 候选：与 D 态一致返回 503
+                    return None, {
+                        "status_code": 503,
+                        "error": "all free pools exhausted, no paid fallback",
+                    }, decision
 
             if resp.status_code != 200:
                 error_text = await resp.aread()
-                decision.success = False
-                yield self._sse_error(
-                    f"upstream {resp.status_code}: {error_text[:500]}"
-                )
-                return
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+                return None, {
+                    "status_code": resp.status_code,
+                    "error": f"upstream {resp.status_code}: {error_text[:500]}",
+                }, decision
 
-            # 一旦开始 yield，不允许再重试
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-            decision.success = True
+            # 成功：返回生成器，由 StreamingResponse 驱动
+            return self._stream_bytes(resp, decision), None, decision
 
         except Exception as e:
-            logger.error(f"[Decision] stream error: {e}")
-            decision.success = False
-            yield self._sse_error(str(e))
-        finally:
+            logger.error(f"[Decision] stream setup error: {e}")
             if resp is not None:
                 try:
                     await resp.aclose()
                 except Exception:
                     pass
+            return None, {
+                "status_code": 502,
+                "error": f"upstream connection failed: {e}",
+            }, decision
+
+    async def _stream_bytes(
+        self,
+        resp,
+        decision: RouterDecisionEventRecord,
+    ) -> AsyncGenerator[bytes, None]:
+        """内部生成器：只负责成功连接后的字节透传和收尾。"""
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+            decision.success = True
+        except Exception as e:
+            logger.error(f"[Decision] stream iteration error: {e}")
+            decision.success = False
+            raise
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
             self._decision_log.append(decision)
             if self._db:
                 from .db import insert_decision_event
@@ -619,6 +660,21 @@ class DecisionEngine:
                     logger.warning(
                         f"[Decision] failed to write stream decision: {e}"
                     )
+
+    async def route_stream(
+        self,
+        request: ChatCompletionRequest,
+        decision: Optional[RouterDecisionEventRecord] = None,
+    ) -> AsyncGenerator[bytes, None]:
+        """向后兼容：直接调用会经历「打开流→检查→yield」三段，但错误只能在
+        SSE body 中表达。新代码应使用 stream_route_setup + StreamingResponse。
+        """
+        generator, error, _ = await self.stream_route_setup(request, decision)
+        if error:
+            yield self._sse_error(error["error"])
+            return
+        async for chunk in generator:
+            yield chunk
 
     @staticmethod
     def _sse_error(message: str) -> bytes:
@@ -633,13 +689,8 @@ class DecisionEngine:
         （生成类先于理解类，避免"生成图片"误判为 vision）
         关键词来源：DEFAULT_TASK_KEYWORDS 合并 config.three_pool_keywords
         """
-        # 合并默认关键词和 config 自定义关键词
-        merged: Dict[str, list[str]] = dict(DEFAULT_TASK_KEYWORDS)
-        cfg_kw = self.config.three_pool_keywords or {}
-        for task_type, kw_list in cfg_kw.items():
-            if task_type not in merged:
-                merged[task_type] = []
-            merged[task_type].extend(kw_list)
+        # M2.5-R3：使用初始化时构建的独立关键词表，避免污染全局。
+        merged = self._task_keywords
 
         # 取最后一条 user 消息（与 v3.9 行为一致）
         user_msg = ""
