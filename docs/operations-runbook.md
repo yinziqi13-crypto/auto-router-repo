@@ -13,7 +13,7 @@
 | 服务名 | auto-router |
 | 部署路径 | `/opt/ai-hub/auto-router/` |
 | 主程序 | `router/main.py` |
-| 监听地址 | `127.0.0.1:8080`（仅本机 + SSH 隧道可达） |
+| 监听地址 | `0.0.0.0:8080`（本机 + Docker 网络可达） |
 | Python 版本 | 3.11（venv 路径 `./venv/`） |
 | 虚拟环境 | `/opt/ai-hub/auto-router/venv/` |
 | 核心依赖 | fastapi / uvicorn / httpx / aiosqlite |
@@ -206,14 +206,14 @@ disown
 curl -s http://127.0.0.1:8080/health | python3 -m json.tool
 ```
 
-**预期返回**（M2-6 版本）：
+**预期返回**（M3 版本）：
 ```json
 {
   "status": "ok",
-  "version": "M2-6",
-  "new_api_base_url": "http://127.0.0.1:3000",
-  "free_providers": ["tencent_free", "bailian_free"],
-  "paid_providers": ["bailian_lite", "tencent_plan"]
+  "service": "auto_router",
+  "version": "3.0.0",
+  "milestone": "M3",
+  "new_api": "http://127.0.0.1:3000"
 }
 ```
 
@@ -245,7 +245,7 @@ curl -s http://127.0.0.1:8080/router/cooldown/status | python3 -m json.tool
 
 | 文件 | 路径 | 说明 |
 |---|---|---|
-| 主日志 | `/tmp/auto-router.log` | uvicorn 访问日志 + 应用日志（nohup 重定向） |
+| 主日志 | `/var/log/auto-router/app.log` | uvicorn 访问日志 + 应用日志（systemd 重定向，logrotate 14 天轮转） |
 | 数据库 | `/opt/ai-hub/auto-router/router/router.db` | aiosqlite，存决策事件 + 冷却状态 |
 | New API 容器日志 | `docker logs aihub-m0` | 上游调用记录（channel_id / 模型名 / 状态码） |
 
@@ -253,16 +253,16 @@ curl -s http://127.0.0.1:8080/router/cooldown/status | python3 -m json.tool
 
 ```bash
 # 查看最近 50 行
-tail -50 /tmp/auto-router.log
+tail -50 /var/log/auto-router/app.log
 
 # 过滤决策日志（每次路由选择都会打）
-grep "decision" /tmp/auto-router.log | tail -20
+grep "decision" /var/log/auto-router/app.log | tail -20
 
 # 过滤 402 降级事件
-grep "402\|fallback\|exhausted" /tmp/auto-router.log | tail -20
+grep "402\|fallback\|exhausted" /var/log/auto-router/app.log | tail -20
 
 # 过滤冷却恢复事件
-grep "cooldown\|recovered\|expired" /tmp/auto-router.log | tail -20
+grep "cooldown\|recovered\|expired" /var/log/auto-router/app.log | tail -20
 ```
 
 **典型日志示例**：
@@ -313,7 +313,7 @@ ss -tlnp | grep 8080  # 应无输出
 pgrep -af "uvicorn.*auto-router" || echo "进程不存在，需要重启"
 
 # 查最后日志（确认 crash 原因）
-tail -30 /tmp/auto-router.log
+tail -30 /var/log/auto-router/app.log
 
 # 常见 crash 原因：
 # 1. router.db 被删除 → 重新创建（自动）或检查路径
@@ -705,4 +705,4 @@ curl -s http://127.0.0.1:8080/health
 
 ---
 
-*文档版本：M2-6 | 更新时间：2026-09-05 | 作者：Auto Router AIHub 项目组*
+*文档版本：M3 | 更新时间：2026-09-07 | 作者：Auto Router AIHub 项目组*

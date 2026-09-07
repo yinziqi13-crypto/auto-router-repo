@@ -80,6 +80,7 @@ uvicorn router.main:app --host 127.0.0.1 --port 8080
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | /v1/chat/completions | POST | OpenAI 兼容接口（流式+非流式） |
+| /v1/models | GET | OpenAI 兼容模型列表 |
 | /health | GET | 健康检查 |
 | /router/stats | GET | 统计数据（支持 time_range 参数） |
 | /router/decisions | GET | 决策日志查询 |
@@ -91,7 +92,7 @@ uvicorn router.main:app --host 127.0.0.1 --port 8080
 - M0：环境部署 + 渠道验证 + 路由机制验证 + 免费额度实验
 - M1：FastAPI 骨架 → DB 持久化 → 路由链路 → 部署 → 五场景集成验证
 - M2：Quota 计量 → 冷却恢复 → 4 池路由 → 状态接口 → 运营看板 → 多供应商框架
-- M3：生产加固 → 全模型覆盖 → DeepSeek 直连 → 流量切换（规划中）
+- M3：生产加固 → 全模型覆盖 → DeepSeek 直连 → 流量切换（已完成，2026-09-07）
 
 ## 红线
 
