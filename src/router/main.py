@@ -66,6 +66,20 @@ _shutdown_event: asyncio.Event = asyncio.Event()
 # M3-1f: config 路径（可被测试 monkeypatch）
 _CONFIG_PATH = Path(__file__).parent / "config.json"
 
+# 管理端点认证 token（环境变量 ADMIN_TOKEN，默认 admin-2026）
+_ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "admin-2026")
+
+
+async def _check_admin(request: Request):
+    """管理端点认证：Bearer token 或 ?token= 查询参数"""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:]
+    else:
+        token = request.query_params.get("token", "")
+    if token != _ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid admin token")
+
 
 # ────────────────────────────────────────────
 # 启动 / 关闭（lifespan，取代 on_event）
@@ -372,7 +386,8 @@ async def list_models():
 # ────────────────────────────────────────────
 
 @app.get("/router/cooldown/status")
-async def get_cooldown_status():
+async def get_cooldown_status(request: Request):
+    await _check_admin(request)
     """返回当前所有 EXHAUSTED 状态的 provider/model/cooldown_until 剩余时间"""
     now = datetime.utcnow()
     items = []
@@ -558,8 +573,10 @@ async def get_decisions(
 
 @app.get("/router/stats")
 async def get_stats(
+    request: Request,
     time_range: str = "24h",
 ):
+    await _check_admin(request)
     """
     从 router_decision_event 表统计（只读，不影响路由）
     返回：total/success/fail/rate、free/paid、分布、时序
@@ -582,8 +599,9 @@ DASHBOARD_HTML_PATH = os.path.join(
 
 
 @app.get("/dashboard")
-async def get_dashboard():
-    """返回运营看板 HTML 页面（纯静态，无登录）"""
+async def get_dashboard(request: Request):
+    """返回运营看板 HTML 页面（需 admin token）"""
+    await _check_admin(request)
     if not os.path.exists(DASHBOARD_HTML_PATH):
         raise HTTPException(status_code=404, detail="dashboard.html not found")
     with open(DASHBOARD_HTML_PATH, "r", encoding="utf-8") as f:

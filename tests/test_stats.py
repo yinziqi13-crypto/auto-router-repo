@@ -302,8 +302,12 @@ async def test_stats_endpoint_with_real_db(tmp_path):
     main_mod._db_conn = conn
 
     try:
-        # 4. 直接调 endpoint 协程
-        stats = await main_mod.get_stats(time_range="1h")
+        # 4. 直接调 endpoint 协程（mock request 以通过 admin 认证）
+        class MockRequest:
+            def __init__(self):
+                self.headers = {"Authorization": "Bearer admin-2026"}
+                self.query_params = {}
+        stats = await main_mod.get_stats(MockRequest(), time_range="1h")
 
         assert stats["total_requests"] == 4
         assert stats["success_count"] == 3
