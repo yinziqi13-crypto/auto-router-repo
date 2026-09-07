@@ -226,6 +226,14 @@ class RouterConfig(BaseModel):
     # 示例: {"text": "deepseek-v4-flash", "vision": null, "audio": null, "image": null}
     # 若 task_type 对应模型为 null 或不在 model_routes → fallback 到 model_routes["text"]
 
+    wildcard_providers: list[str] = Field(default_factory=list)
+    # Wildcard 免费池 provider 列表（M3-2c）：
+    # 不在 provider_models 显式列表里的模型，这些 provider 也算持有该模型
+    # 示例: ["tencent_free", "bailian_free"]
+    wildcard_paid_providers: list[str] = Field(default_factory=list)
+    # Wildcard 付费池 provider 列表（M3-2c）：
+    # 示例: ["bailian_lite", "tencent_plan"]
+
     providers: Optional[Dict[str, Dict[str, Any]]] = None
     # M2-6 多供应商配置，格式：
     # {

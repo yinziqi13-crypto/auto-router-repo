@@ -55,6 +55,9 @@ _active_requests: int = 0
 _active_requests_lock: asyncio.Lock = asyncio.Lock()
 _shutdown_event: asyncio.Event = asyncio.Event()
 
+# M3-1f: config 路径（可被测试 monkeypatch）
+_CONFIG_PATH = Path(__file__).parent / "config.json"
+
 
 # ────────────────────────────────────────────
 # 启动 / 关闭（lifespan，取代 on_event）
@@ -71,13 +74,29 @@ async def lifespan(app: FastAPI):
 
     # ── startup ──
     logger.info("Lifespan startup begin")
-    config_path = Path(__file__).parent / "config.json"
+    config_path = _CONFIG_PATH
     if config_path.exists():
         with open(config_path, "r", encoding="utf-8") as f:
             cfg_dict = json.load(f)
         config = RouterConfig(**cfg_dict)
     else:
         raise RuntimeError("config.json not found. Copy config.example.json to config.json and fill in your tokens.")
+
+    # M3-1f: 启动自检 —— config 必需字段完整性检查
+    _token_missing = [
+        k for k in ("new_api_base_url", "token_free", "token_paid")
+        if not getattr(config, k, None)
+    ]
+    if _token_missing:
+        raise RuntimeError(
+            f"config.json 缺少必需字段: {', '.join(_token_missing)}. "
+            f"请对照 config.example.json 补全。"
+        )
+    if not (config.provider_models or {}):
+        raise RuntimeError(
+            "config.json 的 provider_models 为空，没有任何模型可路由。"
+            "请对照 config.example.json 填写。"
+        )
 
     # 初始化 DB
     db_path = Path(__file__).parent / "router.db"
@@ -107,6 +126,23 @@ async def lifespan(app: FastAPI):
             default_base_url=config.new_api_base_url,
         )
 
+    # M3-1f: New API 连通性检查（失败则拒绝启动）
+    # 放在 provider_registry 初始化后，用 health_check() 做真实连接探测
+    _any_healthy = False
+    for _pname, _pinst in provider_registry.all().items():
+        try:
+            if await _pinst.health_check():
+                _any_healthy = True
+                logger.info(f"New API 连通性检查通过: provider={_pname}")
+                break
+        except Exception as _e:
+            logger.warning(f"New API 连通性检查失败 provider={_pname}: {_e}")
+    if not _any_healthy:
+        raise RuntimeError(
+            f"New API 连通性检查失败（所有 provider 均不可达 {config.new_api_base_url}）。"
+            f"请确认 New API 正在运行，或检查 config.json 的 new_api_base_url。"
+        )
+
     # M2-6: decision_eng 使用 provider_registry（不再直接持有单个 adapter）
     decision_eng = DecisionEngine(
         state_manager=state_mgr,
@@ -114,7 +150,7 @@ async def lifespan(app: FastAPI):
         db_conn=_db_conn,
         provider_registry=provider_registry,
     )
-    logger.info(f"Auto Router M3-1e started, DB={db_path}, NewAPI={config.new_api_base_url}")
+    logger.info(f"Auto Router M3-1f started, DB={db_path}, NewAPI={config.new_api_base_url}")
 
     # 启动后台冷却扫描循环
     global _cooldown_task
@@ -268,7 +304,7 @@ async def health():
     return {
         "status": "ok",
         "service": "auto_router",
-        "version": "M3-1e",
+        "version": "M3-2",
         "new_api": config.new_api_base_url if config else "not_loaded",
     }
 
@@ -365,6 +401,9 @@ async def chat_completions(
     # ── M2.5-W5（规格 3）：未知模型 → 404，不静默回退 ──
     # 只在入口做精确匹配；容错匹配（fuzzy）不在 M2.5 范围，M3 作为独立功能加。
     # auto-free 是虚拟模型，跳过此检查交给决策层做自动选路。
+    # M3-2c：配置了 wildcard_providers 时，点名任意模型都放行给决策引擎
+    # （wildcard 语义 = 该 provider 接受任意模型，模型是否真存在由上游 400 兜底）。
+    # 未配置 wildcard 时保持原 404 行为（向后兼容）。
     from .decision import AUTO_MODEL
     if model != AUTO_MODEL:
         known_models = set()
@@ -374,13 +413,16 @@ async def chat_completions(
             elif isinstance(_cfg, (list, tuple, set)):
                 known_models.update(_cfg)
         if model not in known_models:
-            return JSONResponse(
-                status_code=404,
-                content={"error": {
-                    "message": f"model '{model}' not found in any provider pool",
-                    "type": "model_not_found",
-                }},
-            )
+            wildcard_free = getattr(config, "wildcard_providers", []) or []
+            wildcard_paid = getattr(config, "wildcard_paid_providers", []) or []
+            if not (wildcard_free or wildcard_paid):
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": {
+                        "message": f"model '{model}' not found in any provider pool",
+                        "type": "model_not_found",
+                    }},
+                )
 
     # 3. 路由 + 转发（非流式）或 流式路由（M2.5 起走 route_stream）
     if not stream:

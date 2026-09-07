@@ -131,6 +131,7 @@ def make_cfg():
         provider_priority=["tencent_free", "bailian_free", "tencent_plan"],
         free_providers=["tencent_free", "bailian_free"],
         model_routes={"text": "deepseek-v4-flash", "vision": None},
+        # 不设置 wildcard_providers，保持旧行为（M3-2c 前的测试不变）
     )
 
 

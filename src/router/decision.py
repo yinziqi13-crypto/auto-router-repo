@@ -181,22 +181,33 @@ class DecisionEngine:
         self, model: str, prefer_free: bool = True
     ) -> Optional[str]:
         """
-        选 provider（纯候选匹配 + 优先级排序，不过滤 exhausted）
+        选 provider（纯候选匹配 + wildcard + 优先级排序，不过滤 exhausted）
         返回排序后第一个候选（可能 exhausted，由调用方负责状态判断）
+
+        Wildcard 策略（M3-2c）：
+        - 先在 provider_models 显式列表里找持有该模型的 provider
+        - 如果没找到，wildcard_providers / wildcard_paid_providers 里的 provider 也算持有
         """
         priority = self.config.provider_priority or list(
             self.config.provider_models.keys()
         )
 
-        # 1. 模型匹配：找出所有持用该模型的 provider
+        # 1. 模型匹配：找出所有持有该模型的 provider（显式列表）
         candidates = [
             p for p, models in self.config.provider_models.items()
             if model in models
         ]
+
+        # 2. Wildcard：不在显式列表里时，尝试 wildcard provider
+        if not candidates:
+            wildcard_free = getattr(self.config, "wildcard_providers", [])
+            wildcard_paid = getattr(self.config, "wildcard_paid_providers", [])
+            candidates = list(dict.fromkeys(wildcard_free + wildcard_paid))
+
         if not candidates:
             return priority[0] if priority else None
 
-        # 2. 优先级排序
+        # 3. 优先级排序
         def _idx(p):
             try:
                 return priority.index(p)
@@ -204,7 +215,7 @@ class DecisionEngine:
                 return 999
         candidates.sort(key=_idx)
 
-        # 3. prefer_free 过滤（用 config.free_providers 显式列表，不靠名字推断）
+        # 4. prefer_free 过滤（用 config.free_providers 显式列表，不靠名字推断）
         free_provider_set = set(self.config.free_providers or [])
         if prefer_free:
             free_cands = [p for p in candidates if p in free_provider_set]
@@ -244,6 +255,11 @@ class DecisionEngine:
             p for p, models in provider_models.items()
             if logical_model in (models or [])
         ]
+        # Wildcard 补充（M3-2c）：显式列表里找不到时，wildcard provider 也算候选
+        if not candidates:
+            wildcard_free = getattr(self.config, "wildcard_providers", [])
+            wildcard_paid = getattr(self.config, "wildcard_paid_providers", [])
+            candidates = [p for p in (wildcard_free + wildcard_paid) if p in provider_models]
         candidates.sort(key=_idx)
 
         # 状态 E：模型不在任何 provider 的池里
@@ -680,15 +696,49 @@ class DecisionEngine:
     def _sse_error(message: str) -> bytes:
         return f"data: {json.dumps({'error': message})}\n\n".encode()
 
-    # ── 内部：任务类型检测（M2-3 扩充版） ──┤
+    # ── 内部：任务类型检测（M2-3 扩充版，M3-2e 新增模型名模式识别） ──┤
+    #
+    # 模型名 → task_type 直接映射（M3-2e）：
+    #   vision 模型名特征：vision / vl / ocr / image / 视觉
+    #   audio 模型名特征：audio / asr / tts / speech / voice / whisper
+    #   video 模型名特征：video / vid / movie / clip
+    #   命中模型名模式的优先级高于关键词检测（模型名是用户显式点名，比消息内容更精准）
+    # ─────────────────────────────────────────────────────────────
+
+    _MODEL_NAME_VISION_PATTERNS = [
+        "vision", "vl", "ocr", "image", "视觉",
+    ]
+    _MODEL_NAME_AUDIO_PATTERNS = [
+        "audio", "asr", "tts", "speech", "voice", "whisper",
+    ]
+    _MODEL_NAME_VIDEO_PATTERNS = [
+        "video", "vid", "movie", "clip",
+    ]
+
+    def _detect_model_name_task_type(self, model: str) -> Optional[TaskType]:
+        """M3-2e：根据模型名直接推断任务类型（不依赖消息内容）"""
+        model_lower = model.lower()
+        for p in self._MODEL_NAME_VISION_PATTERNS:
+            if p in model_lower:
+                return TaskType.VISION
+        for p in self._MODEL_NAME_AUDIO_PATTERNS:
+            if p in model_lower:
+                return TaskType.AUDIO
+        for p in self._MODEL_NAME_VIDEO_PATTERNS:
+            if p in model_lower:
+                return TaskType.VIDEO
+        return None
 
     def _detect_task_type(self, request: ChatCompletionRequest) -> TaskType:
         """
-        任务类型检测（M2-3）
-        优先级：image > video > audio > vision
-        （生成类先于理解类，避免"生成图片"误判为 vision）
-        关键词来源：DEFAULT_TASK_KEYWORDS 合并 config.three_pool_keywords
+        任务类型检测（M2-3 + M3-2e）
+        优先级：模型名模式 > 消息内容关键词（生成类先于理解类）
         """
+        # M3-2e：先检查模型名（用户显式点名模型，比消息内容更精准）
+        model_type = self._detect_model_name_task_type(request.model)
+        if model_type is not None:
+            return model_type
+
         # M2.5-R3：使用初始化时构建的独立关键词表，避免污染全局。
         merged = self._task_keywords
 
