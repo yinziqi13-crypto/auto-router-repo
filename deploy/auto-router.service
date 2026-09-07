@@ -11,7 +11,7 @@ User=root
 Group=root
 WorkingDirectory=/opt/ai-hub/auto-router
 Environment=PYTHONPATH=/opt/ai-hub/auto-router
-ExecStart=/opt/ai-hub/auto-router/venv/bin/python -m uvicorn router.main:app --host 127.0.0.1 --port 8080
+ExecStart=/opt/ai-hub/auto-router/venv/bin/python -m uvicorn router.main:app --host 0.0.0.0 --port 8080
 ExecStop=/bin/kill -TERM $MAINPID
 KillSignal=SIGTERM
 TimeoutStopSec=15
