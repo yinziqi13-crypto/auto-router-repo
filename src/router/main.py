@@ -1,17 +1,21 @@
 """
-Auto Router M3-1e 主入口
+Auto Router AIHub V4.0 主入口
 FastAPI 代理骨架 + 流式透传 + 双 token 转发验证 + Provider 注册表
 
 实现内容：
   M2-6  多供应商框架（ProviderRegistry / 多 provider）
   M2.5  流式状态码检查（stream_route_setup）+ 未知模型 404 + Agent 协议兼容
   M3-1e SIGTERM 优雅停机：lifespan + ASGI 活跃请求计数，systemd stop 等待在途请求
+  M3-4d OpenAI 兼容模型列表端点 GET /v1/models
+
+版本号：见 router/__init__.py 的 __version__ / __milestone__
 """
 
 import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -30,6 +34,7 @@ from .providers import ProviderRegistry
 from .adapter import NewAPIAdapter  # 向后兼容：类型引用
 from .decision import DecisionEngine, StateManager
 from .db import init_db
+from . import __version__, __milestone__
 
 # ────────────────────────────────────────────
 # 日志配置
@@ -39,6 +44,9 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 logger = logging.getLogger("auto_router")
+
+# Unix 时间戳（进程启动时刻），供 /v1/models 的 created 字段使用
+_BOOT_TS = int(time.time())
 
 # ────────────────────────────────────────────
 # 全局对象（lifespan 启动时初始化）
@@ -150,7 +158,10 @@ async def lifespan(app: FastAPI):
         db_conn=_db_conn,
         provider_registry=provider_registry,
     )
-    logger.info(f"Auto Router M3-1f started, DB={db_path}, NewAPI={config.new_api_base_url}")
+    logger.info(
+        f"Auto Router {__version__} ({__milestone__}) started, "
+        f"DB={db_path}, NewAPI={config.new_api_base_url}"
+    )
 
     # 启动后台冷却扫描循环
     global _cooldown_task
@@ -274,8 +285,8 @@ class RequestCountMiddleware:
 # App 实例（lifespan 须先定义后引用）
 # ────────────────────────────────────────────
 app = FastAPI(
-    title="Auto Router M3-1e",
-    version="0.3.0",
+    title="Auto Router AIHub",
+    version=__version__,
     lifespan=lifespan,
 )
 
@@ -304,9 +315,56 @@ async def health():
     return {
         "status": "ok",
         "service": "auto_router",
-        "version": "M3-2",
+        "version": __version__,
+        "milestone": __milestone__,
         "new_api": config.new_api_base_url if config else "not_loaded",
     }
+
+
+# ────────────────────────────────────────────
+# /v1/models OpenAI 兼容模型列表（M3-4d）
+# ────────────────────────────────────────────
+
+def _discover_models(cfg: Optional[RouterConfig]) -> list[str]:
+    """汇总当前配置下可受理的模型名（去重、排序）
+
+    来源：
+      1. provider_models 各 provider 显式持有的模型
+      2. model_routes 里配置了推荐模型的任务类型
+
+    注意：配置了 wildcard_providers 时 Auto Router 实际可受理任意模型，
+    本端点只返回「显式已知」清单供客户端枚举，不代表能力上限。
+    """
+    found = set()
+    if not cfg:
+        return []
+    for models in (cfg.provider_models or {}).values():
+        if models:
+            found.update(models)
+    for target in (cfg.model_routes or {}).values():
+        if target:
+            found.add(target)
+    return sorted(found)
+
+
+@app.get("/v1/models")
+async def list_models():
+    """OpenAI 兼容的模型列表端点
+
+    使 OpenAI SDK / Cursor / Cherry Studio 等客户端在 base_url
+    直连 Auto Router(8080) 时也能正常枚举模型（Joint-1 时为 404）。
+    """
+    cfg = config
+    data = [
+        {
+            "id": model_id,
+            "object": "model",
+            "created": _BOOT_TS,
+            "owned_by": "auto-router",
+        }
+        for model_id in _discover_models(cfg)
+    ]
+    return {"object": "list", "data": data}
 
 
 # ────────────────────────────────────────────

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-router"
-version = "2.5.0"
-description = "Auto Router AIHub V4.0 — New API enhancement layer"
+version = "3.0.0"
+description = "Auto Router AIHub V4.0 — New API enhancement layer (milestone M3)"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi==0.115.6",

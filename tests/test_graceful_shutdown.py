@@ -11,6 +11,8 @@ M3-1e / M3-1f / M3-1g: 优雅停机 + 启动自检 单元测试
   7. _shutdown_event 在 shutdown 段被 set()
   8. shutdown 时等待活跃请求归零（最多 13s）后才关闭资源
   9. RequestCountMiddleware 对流式请求的计数时机（响应体发完后 -1）
+ 10. /health 的版本号与 router/__init__.py 的唯一来源一致（M3 统一整改）
+ 11. GET /v1/models 返回 OpenAI 标准结构且列表去重有序（M3-4d）
 """
 
 import asyncio
@@ -219,7 +221,33 @@ def test_lifespan_startup_success(app_with_config):
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert data["version"] == "M3-2"
+        # 版本号必须与 router/__init__.py 的唯一来源一致（M3 统一整改）
+        assert data["version"] == m.__version__
+        assert data["milestone"] == m.__milestone__
+        # 禁止再出现硬编码的历史里程碑号
+        assert data["version"] not in ("M2-6", "M3-1e", "M3-2", "0.3.0")
+
+
+# ────────────────────────────────────
+# 测试 4b: /v1/models 返回 OpenAI 标准结构（M3-4d）
+# ────────────────────────────────────
+
+def test_v1_models_endpoint_shape(app_with_config):
+    """base_url 直连 8080 的客户端需要能枚举模型"""
+    with TestClient(app_with_config) as client:
+        resp = client.get("/v1/models")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["object"] == "list"
+        assert isinstance(data["data"], list)
+        for item in data["data"]:
+            assert item["object"] == "model"
+            assert isinstance(item["id"], str) and item["id"]
+            assert isinstance(item["created"], int)
+            assert item["owned_by"] == "auto-router"
+        # 列表应去重且有序
+        ids = [i["id"] for i in data["data"]]
+        assert ids == sorted(set(ids))
 
 
 # ────────────────────────────────────
