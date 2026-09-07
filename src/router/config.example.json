@@ -6,7 +6,8 @@
     "tencent_free": ["deepseek-v4-flash", "deepseek-v4-pro", "glm-5.2", "kimi-k3", "minimax-m3"],
     "bailian_free": ["deepseek-v4-flash", "qwen3.8-flash", "glm-5.2", "qwen3.7-max", "deepseek/deepseek-v4-flash-vision-exp"],
     "bailian_lite": ["qwen3.8-flash", "qwen3.7-max", "qwen3.6-flash", "deepseek-v4-pro"],
-    "tencent_plan": ["deepseek-v4-flash", "deepseek-v4-pro"]
+    "tencent_plan": ["deepseek-v4-flash", "deepseek-v4-pro"],
+    "deepseek_direct": ["deepseek-v4-flash", "deepseek-v4-pro"]
   },
   "wildcard_providers": ["tencent_free", "bailian_free"],
   "wildcard_paid_providers": ["bailian_lite", "tencent_plan"],
@@ -21,7 +22,8 @@
     "tencent_free",
     "bailian_free",
     "bailian_lite",
-    "tencent_plan"
+    "tencent_plan",
+    "deepseek_direct"
   ],
   "three_pool_keywords": {
     "vision": ["图片", "图像", "看图", "识别图片", "截图", "照片", "图片内容", "分析图片", "读取图片", "image", "photo", "picture", "vision", "visual", "screenshot", "describe this image", "what's in this image"],
@@ -35,6 +37,12 @@
       "type": "new_api",
       "base_url": "http://127.0.0.1:3000",
       "is_default": true
+    },
+    "deepseek_direct": {
+      "type": "openai_direct",
+      "base_url": "https://api.deepseek.com",
+      "api_key": "sk-YOUR_DEEPSEEK_API_KEY_HERE",
+      "is_default": false
     }
   },
   "model_routes": {

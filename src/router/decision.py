@@ -138,12 +138,16 @@ class DecisionEngine:
                     "base_url": getattr(config, "new_api_base_url", ""),
                     "is_default": True,
                 }
-        # provider_name → transport_name 映射（M2-6：当前所有 provider 都走 new_api）
-        # 未来接 deepseek_direct 时，对应 provider 映射到 deepseek_direct transport
+        # provider_name → transport_name 映射（M2-6 + M3-3）
+        # 有独立 providers 配置的 provider 用自身名做 transport，
+        # 其余默认走 new_api transport（通过 New API 中转）
         self._provider_transport: Dict[str, str] = {}
+        _providers_cfg = getattr(config, "providers", None) or {}
         for pname in (config.provider_models or {}).keys():
-            # 默认走 new_api transport
-            self._provider_transport[pname] = "new_api"
+            if pname in _providers_cfg:
+                self._provider_transport[pname] = pname
+            else:
+                self._provider_transport[pname] = "new_api"
 
         # M2.5-R3：在初始化时构建独立、去重的任务关键词表，避免每次请求时
         # 用 dict(DEFAULT_TASK_KEYWORDS) 浅拷贝 + extend 污染全局列表。

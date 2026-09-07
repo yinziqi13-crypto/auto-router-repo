@@ -224,6 +224,164 @@ class NewAPIProvider(Provider):
         await self._client.aclose()
 
 
+class OpenAIDirectProvider(Provider):
+    """OpenAI 兼容直连供应商（M3-3）
+
+    用于直连 DeepSeek 官方 API、OpenAI 官方 API 等。
+    与 NewAPIProvider 的区别：
+    - 使用自身存储的 api_key，不依赖 New API 的 token 参数
+    - 不需要 model_mapping（模型名直接发给上游）
+    - base_url 指向上游官方 API（如 https://api.deepseek.com）
+    """
+
+    def __init__(self, base_url: str, api_key: str):
+        self.base_url = base_url.rstrip("/")
+        self._api_key = api_key
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0))
+
+    async def forward(
+        self,
+        token: str,
+        request: ChatCompletionRequest,
+        model_mapping: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        upstream_model = self._resolve_model(request.model, model_mapping)
+        payload = self._build_payload(request, upstream_model)
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+
+        start = datetime.utcnow()
+        try:
+            resp = await self._client.post(url, headers=headers, json=payload)
+            latency = (datetime.utcnow() - start).total_seconds() * 1000
+            body = None
+            error = None
+            if resp.status_code == 200:
+                body = resp.json()
+            else:
+                error = resp.text[:500]
+                logger.warning(f"[OpenAIDirect] upstream {resp.status_code}: {error}")
+
+            return {
+                "status_code": resp.status_code,
+                "headers": dict(resp.headers),
+                "body": body,
+                "error": error,
+                "latency_ms": latency,
+            }
+        except httpx.ConnectError as e:
+            latency = (datetime.utcnow() - start).total_seconds() * 1000
+            logger.error(f"[OpenAIDirect] connection failed: {e}")
+            return {
+                "status_code": 0,
+                "headers": {},
+                "body": None,
+                "error": f"connection_fail: {str(e)}",
+                "latency_ms": latency,
+            }
+        except httpx.TimeoutException as e:
+            latency = (datetime.utcnow() - start).total_seconds() * 1000
+            return {
+                "status_code": 0,
+                "headers": {},
+                "body": None,
+                "error": f"timeout: {str(e)}",
+                "latency_ms": latency,
+            }
+        except Exception as e:
+            latency = (datetime.utcnow() - start).total_seconds() * 1000
+            return {
+                "status_code": 0,
+                "headers": {},
+                "body": None,
+                "error": f"unexpected: {str(e)}",
+                "latency_ms": latency,
+            }
+
+    async def forward_stream(
+        self,
+        token: str,
+        request: ChatCompletionRequest,
+        model_mapping: Optional[Dict[str, str]] = None,
+    ) -> AsyncGenerator[bytes, None]:
+        resp = await self.open_stream(token, request, model_mapping)
+        try:
+            if resp.status_code != 200:
+                error_text = await resp.aread()
+                raise RuntimeError(
+                    f"upstream {resp.status_code}: {error_text[:500]}"
+                )
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await resp.aclose()
+
+    async def open_stream(
+        self,
+        token: str,
+        request: ChatCompletionRequest,
+        model_mapping: Optional[Dict[str, str]] = None,
+    ) -> httpx.Response:
+        upstream_model = self._resolve_model(request.model, model_mapping)
+        payload = self._build_payload(request, upstream_model, stream=True)
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        req = self._client.build_request("POST", url, json=payload, headers=headers)
+        resp = await self._client.send(req, stream=True)
+        return resp
+
+    async def health_check(self) -> bool:
+        try:
+            resp = await self._client.get(
+                f"{self.base_url}/models",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                timeout=10.0,
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def _resolve_model(
+        self, model: str, mapping: Optional[Dict[str, str]]
+    ) -> str:
+        if mapping and model in mapping:
+            return mapping[model]
+        return model
+
+    def _build_payload(
+        self,
+        request: ChatCompletionRequest,
+        upstream_model: str,
+        stream: bool = False,
+    ) -> dict:
+        payload = {
+            "model": upstream_model,
+            "messages": [
+                m.model_dump(exclude_none=True, mode="json")
+                for m in request.messages
+            ],
+            "stream": stream,
+        }
+        if request.temperature is not None:
+            payload["temperature"] = request.temperature
+        if request.max_tokens is not None:
+            payload["max_tokens"] = request.max_tokens
+        payload.update(request.extra or {})
+        pyd_extra = getattr(request, "__pydantic_extra__", None) or {}
+        payload.update(pyd_extra)
+        return payload
+
+    async def close(self):
+        await self._client.aclose()
+
+
 class ProviderRegistry:
     """Provider 注册表（单例）
 
@@ -253,6 +411,16 @@ class ProviderRegistry:
                 base_url = cfg.get("base_url", default_base_url)
                 self._providers[name] = NewAPIProvider(base_url=base_url)
                 logger.info(f"[Registry] registered '{name}' as NewAPIProvider({base_url})")
+            elif ptype in ("openai_direct", "deepseek_direct"):
+                base_url = cfg.get("base_url", "")
+                api_key = cfg.get("api_key", "")
+                if not api_key:
+                    logger.warning(f"[Registry] provider '{name}' missing api_key, skipping")
+                    continue
+                self._providers[name] = OpenAIDirectProvider(
+                    base_url=base_url, api_key=api_key
+                )
+                logger.info(f"[Registry] registered '{name}' as OpenAIDirectProvider({base_url})")
             else:
                 logger.warning(f"[Registry] unknown provider type: {ptype} for '{name}'")
 

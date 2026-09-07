@@ -69,7 +69,7 @@ class TestProviderRegistry:
             reg.init_from_config(
                 {
                     "deepseek_direct": {
-                        "type": "openai_direct",  # 未实现，M3 才接
+                        "type": "totally_unknown_type",  # 真正的未知类型
                         "base_url": "https://api.deepseek.com",
                         "api_key": "sk-xxx",
                     }
