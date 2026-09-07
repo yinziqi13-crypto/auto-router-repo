@@ -1,28 +1,27 @@
 """
-Auto Router M2-6 主入口
+Auto Router M3-1e 主入口
 FastAPI 代理骨架 + 流式透传 + 双 token 转发验证 + Provider 注册表
 
-实现内容（M2-6 多供应商框架）：
-  1. ProviderRegistry 初始化（config.json providers 配置）
-  2. DecisionEngine 使用 provider_registry（不再直接持有单个 adapter）
-  3. /v1/chat/completions 非流式 + 流式（SSE 透传）
-  4. 双 token 转发（free → 402 → paid 重试 1 次）
-  5. /health 健康检查 + /config 配置查看
-  6. /router/stats 统计接口（M2-1 运营看板）
-  7. /dashboard 运营看板 HTML 页面（M2-1）
+实现内容：
+  M2-6  多供应商框架（ProviderRegistry / 多 provider）
+  M2.5  流式状态码检查（stream_route_setup）+ 未知模型 404 + Agent 协议兼容
+  M3-1e SIGTERM 优雅停机：lifespan + ASGI 活跃请求计数，systemd stop 等待在途请求
 """
 
 import asyncio
 import json
 import logging
-from datetime import datetime
+import os
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import AsyncGenerator, Dict, Any, Optional
+from typing import Dict, Any, Optional
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
 from .models import (
     ChatCompletionRequest, RouterConfig, TaskType, QuotaStatus,
@@ -32,21 +31,18 @@ from .adapter import NewAPIAdapter  # 向后兼容：类型引用
 from .decision import DecisionEngine, StateManager
 from .db import init_db
 
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
 # 日志配置
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 logger = logging.getLogger("auto_router")
 
-# ─────────────────────────────────────────────
-# 全局对象
-# ─────────────────────────────────────────────
-app = FastAPI(title="Auto Router M2-6", version="0.2.0")
-
-# 延迟初始化（startup 时加载 config）
+# ────────────────────────────────────────────
+# 全局对象（lifespan 启动时初始化）
+# ────────────────────────────────────────────
 config: RouterConfig = None  # type: ignore
 provider_registry: ProviderRegistry = None  # type: ignore
 state_mgr: StateManager = None  # type: ignore
@@ -54,14 +50,27 @@ _db_conn = None  # aiosqlite.Connection
 decision_eng: DecisionEngine = None  # type: ignore
 _cooldown_task: Optional[asyncio.Task] = None  # 后台冷却扫描任务
 
+# M3-1e: 优雅停机 —— 活跃请求计数
+_active_requests: int = 0
+_active_requests_lock: asyncio.Lock = asyncio.Lock()
+_shutdown_event: asyncio.Event = asyncio.Event()
 
-# ─────────────────────────────────────────────
-# 启动 / 关闭
-# ─────────────────────────────────────────────
 
-@app.on_event("startup")
-async def startup():
+# ────────────────────────────────────────────
+# 启动 / 关闭（lifespan，取代 on_event）
+# M3-1e：SIGTERM 到来时 uvicorn 会先停止接收新连接，
+# 然后触发 lifespan 的 shutdown 段（yield 之后的代码）。
+# 这里等待在途请求（_active_requests）归零后再释放资源。
+# systemd 侧 TimeoutStopSec=15，等待上限取 13s 留 2s 余量。
+# ────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Auto Router 应用生命周期：启动初始化 / 关闭优雅停机"""
     global config, provider_registry, state_mgr, decision_eng, _db_conn
+
+    # ── startup ──
+    logger.info("Lifespan startup begin")
     config_path = Path(__file__).parent / "config.json"
     if config_path.exists():
         with open(config_path, "r", encoding="utf-8") as f:
@@ -105,12 +114,49 @@ async def startup():
         db_conn=_db_conn,
         provider_registry=provider_registry,
     )
-    logger.info(f"Auto Router M1-2 started, DB={db_path}, NewAPI={config.new_api_base_url}")
+    logger.info(f"Auto Router M3-1e started, DB={db_path}, NewAPI={config.new_api_base_url}")
 
     # 启动后台冷却扫描循环
     global _cooldown_task
     _cooldown_task = asyncio.create_task(_cooldown_loop())
     logger.info("Cooldown scan loop started")
+
+    # 将控制权交给 FastAPI（服务开始接收请求）
+    yield
+
+    # ── shutdown（SIGTERM 后执行）──
+    logger.info("Lifespan shutdown begin — waiting for active requests...")
+    _shutdown_event.set()
+
+    # 等待活跃请求完成：轮询 _active_requests，最多 13 秒
+    for _i in range(13):
+        async with _active_requests_lock:
+            if _active_requests <= 0:
+                logger.info("All active requests finished, proceeding shutdown")
+                break
+        await asyncio.sleep(1)
+    else:
+        async with _active_requests_lock:
+            logger.warning(
+                f"Shutdown timeout: {_active_requests} active requests still pending after 13s"
+            )
+
+    # 取消冷却扫描任务
+    if _cooldown_task and not _cooldown_task.done():
+        _cooldown_task.cancel()
+        try:
+            await _cooldown_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Cooldown scan loop stopped")
+
+    if state_mgr:
+        await state_mgr.stop()
+    if provider_registry:
+        await provider_registry.close_all()
+    if _db_conn:
+        await _db_conn.close()
+    logger.info("Auto Router shut down")
 
 
 async def _cooldown_loop():
@@ -124,54 +170,112 @@ async def _cooldown_loop():
             logger.warning(f"[Cooldown] loop error: {e}")
 
 
-@app.on_event("shutdown")
-async def shutdown():
-    global _db_conn, _cooldown_task, provider_registry
-    # 取消冷却扫描任务
-    if _cooldown_task and not _cooldown_task.done():
-        _cooldown_task.cancel()
+# ────────────────────────────────────────────
+# M3-1e: 纯 ASGI 中间件 —— 精确计数（含流式）
+# ────────────────────────────────────────────
+
+async def _incr_active_requests():
+    """活跃请求数 +1（模块级，供闭包安全调用）"""
+    global _active_requests
+    async with _active_requests_lock:
+        _active_requests += 1
+
+
+async def _decr_active_requests():
+    """活跃请求数 -1（模块级，供闭包安全调用）"""
+    global _active_requests
+    async with _active_requests_lock:
+        _active_requests -= 1
+
+
+class RequestCountMiddleware:
+    """
+    纯 ASGI 中间件（非 BaseHTTPMiddleware），
+    在接收请求时 +1，在发送完整个响应体（含 SSE 流）后 -1。
+    BaseHTTPMiddleware 的 call_next 返回时流式 body 尚未发完，计数不准。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # 请求进入：+1
+        await _incr_active_requests()
+
+        original_send = send
+        decremented = False
+
+        async def wrapped_send(message):
+            nonlocal decremented
+            await original_send(message)
+            # ASGI 响应结束标志：more_body=False 的 http.response.body 是最后一个消息
+            if (
+                message["type"] == "http.response.body"
+                and not message.get("more_body", False)
+                and not decremented
+            ):
+                decremented = True
+                await _decr_active_requests()
+
         try:
-            await _cooldown_task
-        except asyncio.CancelledError:
-            pass
-        logger.info("Cooldown scan loop stopped")
-    if state_mgr:
-        await state_mgr.stop()
-    if provider_registry:
-        await provider_registry.close_all()
-    if _db_conn:
-        await _db_conn.close()
-    logger.info("Auto Router shut down")
+            await self.app(scope, receive, wrapped_send)
+        except BaseException:
+            # 异常路径（含 CancelledError）：若响应体未发完则补 -1
+            if not decremented:
+                await _decr_active_requests()
+            raise
+
+        # app 正常返回但从未发过结束 body（非标准响应路径）：补 -1
+        if not decremented:
+            await _decr_active_requests()
 
 
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
+# App 实例（lifespan 须先定义后引用）
+# ────────────────────────────────────────────
+app = FastAPI(
+    title="Auto Router M3-1e",
+    version="0.3.0",
+    lifespan=lifespan,
+)
+
+# 注册 ASGI 中间件（必须在所有路由之前）
+app.add_middleware(RequestCountMiddleware)
+
+
+# ────────────────────────────────────────────
 # 依赖注入
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
 
 def get_config() -> RouterConfig:
     return config
+
 
 def get_decision_eng() -> DecisionEngine:
     return decision_eng
 
 
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
 # /health 健康检查
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
         "service": "auto_router",
-        "version": "M2-6",
+        "version": "M3-1e",
         "new_api": config.new_api_base_url if config else "not_loaded",
     }
 
 
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
 # /router/cooldown/status 冷却状态查看
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
 
 @app.get("/router/cooldown/status")
 async def get_cooldown_status():
@@ -197,9 +301,9 @@ async def get_cooldown_status():
     return {"total": len(items), "items": items}
 
 
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
 # 内部辅助函数
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
 
 async def _record_stream_decision(eng: DecisionEngine, decision):
     """流式请求结束后回写 decision event 到 DB（不阻塞）"""
@@ -318,10 +422,10 @@ async def chat_completions(
     )
 
 
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
 # /router/decisions 查看决策日志（从 DB 查询）
 # 参数：limit(默认50), offset(默认0), model(可选), success_only(true/false)
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
 
 @app.get("/router/decisions")
 async def get_decisions(
@@ -352,8 +456,6 @@ async def get_decisions(
 # /router/stats 统计接口（M2-1 运营看板）
 # ────────────────────────────────────────────
 
-from datetime import timedelta
-
 @app.get("/router/stats")
 async def get_stats(
     time_range: str = "24h",
@@ -374,11 +476,10 @@ async def get_stats(
 # /dashboard 运营看板 HTML 页面（M2-1）
 # ────────────────────────────────────────────
 
-import os
-
 DASHBOARD_HTML_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "static", "dashboard.html"
 )
+
 
 @app.get("/dashboard")
 async def get_dashboard():
@@ -387,17 +488,16 @@ async def get_dashboard():
         raise HTTPException(status_code=404, detail="dashboard.html not found")
     with open(DASHBOARD_HTML_PATH, "r", encoding="utf-8") as f:
         html = f.read()
-    from fastapi.responses import HTMLResponse
     return HTMLResponse(content=html, status_code=200)
 
 
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
 # 主入口
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────────
 
 if __name__ == "__main__":
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
         port=8080,
         reload=False,
