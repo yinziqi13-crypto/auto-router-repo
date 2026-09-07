@@ -1,8 +1,8 @@
-﻿# Auto Router 运维手册（M3-0）
+﻿# Auto Router 运维手册（M3-1）
 
-> 版本：M2-6（2026-09-05）  
+> 版本：M3-1（2026-09-07）  
 > 适用环境：M0 验证机（***SERVER-IP***，TencentOS 4）  
-> 下一步：M3 生产加固将改为 systemd 管理，本文记录当前 nohup 方式，作为过渡文档。
+> 管理方式：systemd（M3-1 已完成部署，替代 nohup）
 
 ---
 
@@ -19,70 +19,91 @@
 | 核心依赖 | fastapi / uvicorn / httpx / aiosqlite |
 | 配置文件 | `/opt/ai-hub/auto-router/router/config.json` |
 | 数据库 | `/opt/ai-hub/auto-router/router/router.db`（aiosqlite，自动创建） |
-| 日志文件 | `/tmp/auto-router.log`（nohup 重定向） |
+| 日志文件 | `/var/log/auto-router/app.log`（systemd 重定向，logrotate 14 天轮转） |
 | 上游 New API | `http://127.0.0.1:3000`（Docker 容器 `aihub-m0`） |
 
 ---
 
-## 二、启停命令（当前 nohup 方式）
+## 二、启停命令（systemd 方式）
 
-> ⚠️ M3-1 将改为 systemd，届时本节命令会变化。当前方式在 M3 完成前仍有效。
+> M3-1 已部署 systemd 管理。service 文件位于 `/etc/systemd/system/auto-router.service`，日志轮转 `/etc/logrotate.d/auto-router`。
 
 ### 2.1 启动
 
 ```bash
-# 方式一：cd 进目录后用相对路径（推荐，避免 ModuleNotFoundError）
-cd /opt/ai-hub/auto-router
-nohup ./venv/bin/python -m uvicorn router.main:app \
-  --host 127.0.0.1 --port 8080 \
-  > /tmp/auto-router.log 2>&1 &
-disown
-
-# 方式二：绝对路径（需确保 router 包能被找到）
-nohup /opt/ai-hub/auto-router/venv/bin/python -m uvicorn \
-  --app-dir /opt/ai-hub/auto-router router.main:app \
-  --host 127.0.0.1 --port 8080 \
-  > /tmp/auto-router.log 2>&1 &
-disown
+systemctl start auto-router
 ```
 
 ### 2.2 停止
 
 ```bash
-# 查找进程
-pgrep -af uvicorn
-# 输出示例：12345 /opt/ai-hub/auto-router/venv/bin/python -m uvicorn ...
+# 优雅停止（SIGTERM，等待 15s 超时）
+systemctl stop auto-router
 
-# 停止（优雅终止，等待当前请求完成）
-kill 12345
-
-# 强制停止（如果优雅终止失败）
-kill -9 12345
+# 如果卡住，强制终止
+systemctl kill -s SIGKILL auto-router
 ```
 
 ### 2.3 重启
 
 ```bash
-# 先停后启
-kill $(pgrep -f "uvicorn.*auto-router") 2>/dev/null; sleep 2
-cd /opt/ai-hub/auto-router
-nohup ./venv/bin/python -m uvicorn router.main:app \
-  --host 127.0.0.1 --port 8080 \
-  > /tmp/auto-router.log 2>&1 &
-disown
+systemctl restart auto-router
 ```
 
 ### 2.4 查状态
 
 ```bash
-# 进程是否存在
-pgrep -af "uvicorn.*auto-router" && echo "✅ 进程在跑" || echo "❌ 进程不存在"
+# 服务状态
+systemctl status auto-router
+
+# 是否运行中
+systemctl is-active auto-router
+
+# 是否开机自启
+systemctl is-enabled auto-router
 
 # 端口是否监听
-ss -tlnp | grep 8080 && echo "✅ 端口 8080 监听中" || echo "❌ 端口未监听"
+ss -tlnp | grep 8080
 
-# 健康检查（最快确认服务正常）
+# 健康检查
 curl -s http://127.0.0.1:8080/health | python3 -m json.tool
+```
+
+### 2.5 崩溃自动恢复
+
+systemd 配置 `Restart=on-failure` + `RestartSec=3`：
+- 进程异常退出 → 3 秒后自动重启
+- `kill -9` 后约 6-8 秒恢复（3s 等待 + 3-5s 启动）
+- 日志自动写入 `/var/log/auto-router/app.log`，logrotate 14 天轮转
+
+### 2.6 首次部署
+
+```bash
+# 从仓库 deploy/ 目录安装
+bash deploy/install-systemd.sh
+# 或手动安装：
+# cp deploy/auto-router.service /etc/systemd/system/
+# cp deploy/auto-router.logrotate /etc/logrotate.d/
+# mkdir -p /var/log/auto-router
+# systemctl daemon-reload
+# systemctl enable --now auto-router
+```
+
+### 2.7 回退到 nohup（紧急）
+
+如果 systemd 管理出问题需要临时回退：
+
+```bash
+# 停止 systemd 服务
+systemctl stop auto-router
+systemctl disable auto-router
+
+# nohup 启动
+cd /opt/ai-hub/auto-router
+nohup ./venv/bin/python -m uvicorn router.main:app \
+  --host 127.0.0.1 --port 8080 \
+  > /tmp/auto-router.log 2>&1 &
+disown
 ```
 
 ---

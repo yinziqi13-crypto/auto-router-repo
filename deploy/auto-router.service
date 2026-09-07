@@ -10,15 +10,13 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/opt/ai-hub/auto-router
+Environment=PYTHONPATH=/opt/ai-hub/auto-router
 ExecStart=/opt/ai-hub/auto-router/venv/bin/python -m uvicorn router.main:app --host 127.0.0.1 --port 8080
 ExecStop=/bin/kill -TERM $MAINPID
 KillSignal=SIGTERM
 TimeoutStopSec=15
 Restart=on-failure
 RestartSec=3
-RestartPreventExitStatus=0
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
