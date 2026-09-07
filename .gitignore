@@ -19,6 +19,7 @@ env/
 
 # Config with secrets
 src/config.json
+src/router/config.json
 
 # Pytest
 .pytest_cache/

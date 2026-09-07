@@ -571,7 +571,7 @@ curl -s http://127.0.0.1:8080/health | python3 -m json.tool
 >
 > M3-1 改为 systemd 管理后，venv 重建需在 `ExecStartPre` 中加入依赖检查。
 
-> **测试环境注意**：`pyproject.toml` 的 `pythonpath=["src"]` 只把 `src/` 加入搜索路径，但 `import router` 会找 `src/router/` 目录（不存在）。仓库内测试依赖 `tests/conftest.py` 注册 `types.ModuleType("router")` 虚拟包做兜底。线上部署路径恰好叫 `router/` 所以不受影响。重建 venv 后跑测试如遇 `ModuleNotFoundError: No module named 'router'`，确认 conftest.py 未被删除。
+> **包目录结构（T-R3 修复）**：仓库源码在 `src/router/` 子目录下，`pyproject.toml` 的 `pythonpath=["src"]` 使 `import router` 直接解析到 `src/router/`。仓库结构与线上部署路径 `/opt/ai-hub/auto-router/router/` 对齐。`tests/conftest.py` 仅保留 aiosqlite mock 污染修复，不再需要包映射兜底。
 
 ---
 
