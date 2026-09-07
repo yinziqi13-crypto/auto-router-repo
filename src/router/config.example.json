@@ -6,7 +6,7 @@
     "tencent_free": ["deepseek-v4-flash", "qwen3.8-flash", "glm-5.2"],
     "bailian_free": ["deepseek-v4-flash", "qwen3.8-flash", "glm-5.2"],
     "bailian_lite": ["qwen3.8-flash", "qwen3.7-max", "qwen3.6-flash"],
-    "tencent_plan": ["deepseek-v4-flash", "deepseek-v4-pro", "qwen3.8-flash"]
+    "tencent_plan": ["deepseek-v4-flash", "deepseek-v4-pro"]
   },
   "model_mapping": {
     "tencent_plan": {
