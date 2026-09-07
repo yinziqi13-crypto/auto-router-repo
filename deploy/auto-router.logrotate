@@ -1,0 +1,12 @@
+/var/log/auto-router/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    postrotate
+        systemctl reload auto-router > /dev/null 2>&1 || true
+    endpostrotate
+}
